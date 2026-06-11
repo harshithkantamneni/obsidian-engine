@@ -19,6 +19,8 @@ python run_pipeline.py "The Secret History of the Internet"
 # ☕ Come back in 15 minutes. Your video is on YouTube.
 ```
 
+**See the output live:** every video on [@ObsidianArchiveUnearthed](https://www.youtube.com/@ObsidianArchiveUnearthed) was produced end-to-end by this pipeline.
+
 [Quick Start](#quick-start) · [How It Works](#how-it-works) · [Content Profiles](#content-profiles) · [Configuration](#configuration) · [Contributing](CONTRIBUTING.md)
 
 </div>
@@ -227,7 +229,7 @@ obsidian-engine/
 ├── obsidian.yaml          # Single config file
 ├── profiles/              # Content style definitions
 ├── providers/             # Pluggable backends (LLM, TTS, images, etc.)
-├── agents/                # 15 specialized AI agents (one per stage)
+├── agents/                # 15 specialized AI agents across the 13 stages (incl. 04b Script Doctor, 07b Visual Continuity)
 ├── core/                  # Schemas, logging, cost tracking, config
 ├── pipeline/              # Media processing (audio, images, video)
 ├── clients/               # API clients
