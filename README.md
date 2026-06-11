@@ -78,7 +78,7 @@ Every stage has **quality gates**, **automatic retries**, and **self-healing rec
 ### Option 1: Docker (recommended)
 
 ```bash
-git clone https://github.com/Drogon4231/obsidian-engine.git
+git clone https://github.com/harshithkantamneni/obsidian-engine.git
 cd obsidian-engine
 cp .env.example .env     # Add your API keys
 docker compose up --build
@@ -89,7 +89,7 @@ Open `http://localhost:8080` → use the **Setup Wizard** to configure everythin
 ### Option 2: Local
 
 ```bash
-git clone https://github.com/Drogon4231/obsidian-engine.git
+git clone https://github.com/harshithkantamneni/obsidian-engine.git
 cd obsidian-engine
 
 python -m venv .venv && source .venv/bin/activate
@@ -257,11 +257,11 @@ obsidian-engine/
 - [x] **Docker + Docker Compose** — one-command deployment
 - [x] **Setup Wizard** — browser-based configuration for non-technical users
 - [x] **1,400+ tests** — 26%+ coverage, CI on every push
-- [ ] Knowledge graph for cross-video intelligence ([#20](https://github.com/Drogon4231/obsidian-engine/issues/20))
-- [ ] A/B testing for titles & thumbnails ([#25](https://github.com/Drogon4231/obsidian-engine/issues/25))
-- [ ] TikTok & Instagram Reels export ([#26](https://github.com/Drogon4231/obsidian-engine/issues/26))
-- [ ] More LLM providers: Gemini, Ollama ([#21](https://github.com/Drogon4231/obsidian-engine/issues/21), [#6](https://github.com/Drogon4231/obsidian-engine/issues/6))
-- [ ] More image providers: DALL-E, Stability AI ([#11](https://github.com/Drogon4231/obsidian-engine/issues/11), [#14](https://github.com/Drogon4231/obsidian-engine/issues/14))
+- [ ] Knowledge graph for cross-video intelligence ([#20](https://github.com/harshithkantamneni/obsidian-engine/issues/20))
+- [ ] A/B testing for titles & thumbnails ([#25](https://github.com/harshithkantamneni/obsidian-engine/issues/25))
+- [ ] TikTok & Instagram Reels export ([#26](https://github.com/harshithkantamneni/obsidian-engine/issues/26))
+- [ ] More LLM providers: Gemini, Ollama ([#21](https://github.com/harshithkantamneni/obsidian-engine/issues/21), [#6](https://github.com/harshithkantamneni/obsidian-engine/issues/6))
+- [ ] More image providers: DALL-E, Stability AI ([#11](https://github.com/harshithkantamneni/obsidian-engine/issues/11), [#14](https://github.com/harshithkantamneni/obsidian-engine/issues/14))
 
 ## Running Tests
 
@@ -280,7 +280,7 @@ cd remotion && npm test && npm run lint
 
 Contributions welcome — especially new providers and content profiles. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and guidelines.
 
-Looking for a place to start? Check issues labeled [`good first issue`](https://github.com/Drogon4231/obsidian-engine/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Looking for a place to start? Check issues labeled [`good first issue`](https://github.com/harshithkantamneni/obsidian-engine/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 
 ## License
 
@@ -290,7 +290,7 @@ Looking for a place to start? Check issues labeled [`good first issue`](https://
 
 <div align="center">
 
-**Built by [Harshith Kantamneni](https://github.com/Drogon4231)**
+**Built by [Harshith Kantamneni](https://github.com/harshithkantamneni)**
 
 If this saves you time, consider giving it a ⭐
 

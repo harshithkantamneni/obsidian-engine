@@ -4,7 +4,7 @@
 
 Open-source AI video pipeline. Takes a topic, outputs a complete YouTube video. Pluggable providers, swappable content styles, browser-based setup wizard. MIT licensed.
 
-**Repo:** https://github.com/Drogon4231/obsidian-engine
+**Repo:** https://github.com/harshithkantamneni/obsidian-engine
 
 ## Architecture
 
@@ -241,7 +241,7 @@ Note: CI uses bare `python` (GitHub Actions), locally use `.venv/bin/python`. ~1
 
 ## Open Issues (19)
 
-Contributors welcome! See https://github.com/Drogon4231/obsidian-engine/issues
+Contributors welcome! See https://github.com/harshithkantamneni/obsidian-engine/issues
 
 **Good first issues**: Content profiles (gaming, cooking, science, podcast, news), image providers (DALL-E, Stability AI), TTS providers (Google Cloud), footage providers (Pixabay), upload providers (S3/R2), LLM providers (Ollama)
 

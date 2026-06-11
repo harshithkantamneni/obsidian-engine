@@ -6,7 +6,7 @@ Thanks for your interest in contributing! This guide will help you get started.
 
 ```bash
 # Fork and clone the repo
-git clone https://github.com/Drogon4231/obsidian-engine.git
+git clone https://github.com/harshithkantamneni/obsidian-engine.git
 cd obsidian-engine
 
 # Python environment
