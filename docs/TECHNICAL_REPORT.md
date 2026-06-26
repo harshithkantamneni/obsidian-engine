@@ -916,4 +916,4 @@ From print-based logging to full observability:
 
 ---
 
-*Report compiled March 2026. Source: github.com/Drogon4231/obsidian-archive (172 commits, 1,310 tests, 57% coverage).*
+*Report compiled March 2026. Source: github.com/harshithkantamneni/obsidian-archive (172 commits, 1,310 tests, 57% coverage).*

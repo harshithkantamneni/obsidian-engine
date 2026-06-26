@@ -988,4 +988,4 @@ python -m pytest tests/ -v --tb=short --cov=.
 
 ---
 
-*Document generated March 2026. For the latest version, see the repository at github.com/Drogon4231/obsidian-archive.*
+*Document generated March 2026. For the latest version, see the repository at github.com/harshithkantamneni/obsidian-archive.*
