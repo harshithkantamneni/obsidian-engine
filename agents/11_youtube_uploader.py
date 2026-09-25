@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Agent 11 — YouTube Uploader
-Uploads rendered video to YouTube with SEO metadata.
-First run opens browser for OAuth. Subsequent runs use saved token.
+Agent 11 — Uploader (stage 13)
+Builds title/description/tags/thumbnail from the SEO data, then publishes via
+the configured upload provider (providers.upload in obsidian.yaml):
+
+  - "youtube": uploads to YouTube with SEO metadata and runs the YouTube-only
+    follow-ups (sources comment, era playlist, endscreen/cards). First run
+    opens a browser for OAuth; subsequent runs use the saved token.
+  - anything else ("local" by default, or your own UploadProvider):
+    provider.upload(video, title, description, tags, thumbnail).
 """
 from __future__ import annotations
 
@@ -922,6 +928,38 @@ def batch_set_public(video_ids, stagger=True):
     return results
 
 
+def upload_with_provider(video_path, title, description, tags, thumbnail_path=None) -> dict:
+    """Publish through a non-YouTube upload provider (providers.upload).
+
+    Returns the provider's result dict plus {"provider": <name>}. Raises if the
+    provider returns no video_id (stage validation treats that as a failure).
+    """
+    from providers.registry import get_provider, get_provider_name
+    provider = get_provider("upload")
+    name = get_provider_name("upload")
+    print(f"[Upload] Publishing via upload provider '{name}' ({provider.name})")
+    result = provider.upload(
+        Path(video_path), title, description, list(tags or []),
+        Path(thumbnail_path) if thumbnail_path else None,
+    )
+    result = dict(result or {})
+    if not result.get("video_id"):
+        raise RuntimeError(f"Upload provider '{name}' returned no video_id: {result}")
+    result.setdefault("url", "")
+    result["provider"] = name
+    print(f"[Upload] ✓ {result.get('status', 'done')}: {result.get('url', '')}")
+    return result
+
+
+def _youtube_privacy(default: str) -> str:
+    """providers.upload.options.privacy (youtube provider) overrides the call default."""
+    try:
+        from providers.registry import get_provider
+        return getattr(get_provider("upload"), "privacy", None) or default
+    except Exception:
+        return default
+
+
 def run(seo_data, manifest, verification_data=None, research_data=None, privacy="public", thumbnail_path=None):
     """Main entry point called from run_pipeline.py"""
 
@@ -953,7 +991,13 @@ def run(seo_data, manifest, verification_data=None, research_data=None, privacy=
         seo_data["chapter_markers"] = real_chapters
         description = build_description(seo_data, verification_data)
 
-    result  = upload_video(video_path, title, description, tags, thumbnail, privacy)
+    from providers.registry import get_provider_name
+    if get_provider_name("upload") != "youtube":
+        # Non-YouTube provider: publish and skip YouTube-only follow-ups
+        return upload_with_provider(video_path, title, description, tags, thumbnail)
+
+    result  = upload_video(video_path, title, description, tags, thumbnail, _youtube_privacy(privacy))
+    result["provider"] = "youtube"
     video_id = result.get("video_id", "")
 
     # Post sources comment

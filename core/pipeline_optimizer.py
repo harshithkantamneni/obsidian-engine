@@ -39,7 +39,7 @@ STAGE_META = {
     10: {"name": "Images",              "agent": None,                         "critical": False},
     11: {"name": "Remotion Conversion", "agent": None,                         "critical": True},
     12: {"name": "Video Render",        "agent": None,                         "critical": True},
-    13: {"name": "YouTube Upload",      "agent": None,                         "critical": True},
+    13: {"name": "Upload",              "agent": None,                         "critical": True},
 }
 
 STAGE_NAMES = {k: v["name"] for k, v in STAGE_META.items()}

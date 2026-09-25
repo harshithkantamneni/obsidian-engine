@@ -154,8 +154,11 @@ def _shorts_pipeline_impl(ctx: PipelineContext, runner: StageRunner):
                 if candidate.exists():
                     thumb = str(candidate)
                     break
+            from providers.registry import get_provider_name
+            if get_provider_name("upload") != "youtube":
+                return a11.upload_with_provider(video_path, _title, _description, _tags, thumb)
             return a11.upload_video(video_path, _title, _description, _tags,
-                                    thumbnail_path=thumb, privacy="public")
+                                    thumbnail_path=thumb, privacy=a11._youtube_privacy("public"))
 
         _short_upload_result = runner.run_short_stage("short_upload", "Short Upload", do_short_upload)
 
