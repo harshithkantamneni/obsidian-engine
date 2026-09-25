@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", interpolate=False)
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from core.agent_wrapper import call_agent

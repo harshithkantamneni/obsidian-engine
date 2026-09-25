@@ -14,7 +14,7 @@ from pathlib import Path
 _BASE = Path(__file__).resolve().parent.parent
 sys.path.append(str(_BASE))
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(dotenv_path=_BASE / ".env", interpolate=False)
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 try:

@@ -18,7 +18,7 @@ _BASE = Path(__file__).resolve().parent.parent
 sys.path.append(str(_BASE))
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=_BASE / ".env")
+load_dotenv(dotenv_path=_BASE / ".env", interpolate=False)
 
 from core.agent_wrapper import call_agent
 

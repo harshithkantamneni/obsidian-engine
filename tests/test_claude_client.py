@@ -1,8 +1,10 @@
 """Tests for claude_client.py — .env parsing, cost tracking, JSON handling."""
+import os
 import sys
 import json
+import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -10,20 +12,16 @@ from clients import claude_client
 
 
 class TestEnvParser:
-    """Test the custom .env file parser in claude_client.py."""
+    """Test claude_client's .env loader (python-dotenv, no ${VAR} expansion)."""
 
-    def _parse_env(self, content):
-        """Simulate the .env parser logic from claude_client.py."""
-        result = {}
-        for line in content.splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                v = v.strip()
-                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
-                    v = v[1:-1]
-                result[k.strip()] = v
-        return result
+    def _parse_env(self, content, preset=None):
+        """Run claude_client._load_env_file on content; return the environment it leaves."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".env"
+            path.write_text(content)
+            with patch.dict(os.environ, preset or {}, clear=True):
+                claude_client._load_env_file(path)
+                return dict(os.environ)
 
     def test_simple_key_value(self):
         result = self._parse_env("FOO=bar")
@@ -67,9 +65,24 @@ class TestEnvParser:
         assert result["MSG"] == "hello world"
 
     def test_unquoted_value_with_hash(self):
-        """Unquoted values with # are kept as-is (not treated as comments)."""
+        """A # with no whitespace before it is part of the value, not a comment."""
         result = self._parse_env("COLOR=#FF0000")
         assert result["COLOR"] == "#FF0000"
+
+    def test_dollar_references_load_literally(self):
+        result = self._parse_env("A=one\nB=${A}\nC=pre${A}post\nD=${UNSET}\n")
+        assert result["B"] == "${A}"
+        assert result["C"] == "pre${A}post"
+        assert result["D"] == "${UNSET}"
+
+    def test_existing_environment_wins(self):
+        result = self._parse_env("KEY=from_file\n", preset={"KEY": "from_env"})
+        assert result["KEY"] == "from_env"
+
+    def test_missing_file_is_a_noop(self, tmp_path):
+        with patch.dict(os.environ, {}, clear=True):
+            claude_client._load_env_file(tmp_path / "absent.env")
+            assert dict(os.environ) == {}
 
 
 class TestCostTracking:

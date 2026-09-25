@@ -5,12 +5,14 @@ Serves monitoring dashboard at GET / and exposes pipeline control API.
 Start via scheduler.py (daemon thread) or standalone: python3 webhook_server.py
 """
 
+import io
 import os
 import sys
 import json
 import re
 import hmac
 import secrets
+import tempfile
 import time as _time
 import threading
 import subprocess
@@ -25,8 +27,9 @@ from collections import deque
 from flask import Flask, request, jsonify, session, redirect, send_from_directory
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from dotenv import load_dotenv
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+from dotenv import dotenv_values, load_dotenv
+from dotenv.parser import parse_stream
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", interpolate=False)
 
 from core.pipeline_config import (  # noqa: E402  — must follow load_dotenv()
     WEBHOOK_MAX_TRIGGERS_PER_HOUR,
@@ -1899,7 +1902,7 @@ def _setup_providers_section() -> dict:
     path = Path(os.environ["OBSIDIAN_CONFIG"]) if os.getenv("OBSIDIAN_CONFIG") else CONFIG_YAML_PATH
     try:
         import yaml
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
     section = data.get("providers") if isinstance(data, dict) else None
@@ -2121,7 +2124,12 @@ def api_setup_validate():
 
 
 _SETUP_ALLOWED_KEYS = frozenset(entry["key"] for entry in _SETUP_API_KEYS)
-_ENV_VALUE_FORBIDDEN = re.compile(r"[\r\n\x00]")
+_ENV_VALUE_OK = re.compile(r"[\x21-\x7E]+")  # printable ASCII, no spaces
+# Special to .env readers: Docker Compose env_file interpolates $, and
+# python-dotenv treats a leading quote (and escapes inside it) specially.
+_ENV_VALUE_BANNED = frozenset("$\"'\\`")
+_ENV_VALUE_MAX_LEN = 4096
+_SETUP_WRITE_LOCK = threading.Lock()  # one /api/setup/save write at a time
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CUSTOM_PROVIDER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
 _AUTO_PROVIDER_TYPES = frozenset({"music", "sfx"})
@@ -2151,7 +2159,7 @@ def _validate_setup_payload(data: dict):
     """
     errors = []
 
-    # ── API keys: allow-listed names, single-line values ──
+    # ── API keys: allow-listed names, printable-ASCII values ──
     keys_in = data.get("keys") or {}
     keys = {}
     if not isinstance(keys_in, dict):
@@ -2166,12 +2174,16 @@ def _validate_setup_payload(data: dict):
             if not isinstance(v, str):
                 errors.append(f"Value for {k} must be a string")
                 continue
-            v = v.strip()
-            if _ENV_VALUE_FORBIDDEN.search(v):
-                errors.append(f"Value for {k} contains a line break or NUL")
+            v = v.strip(" \t\r\n")
+            if not v:
                 continue
-            if v:
-                keys[k] = v
+            if (len(v) > _ENV_VALUE_MAX_LEN or not _ENV_VALUE_OK.fullmatch(v)
+                    or _ENV_VALUE_BANNED.intersection(v)):
+                errors.append(f"Value for {k} must be printable ASCII (at most "
+                              f"{_ENV_VALUE_MAX_LEN} characters) with no spaces, "
+                              "quotes, backslashes, backticks or '$'")
+                continue
+            keys[k] = v
 
     # ── Profile: must be an existing profiles/<name>.yaml ──
     profile = data.get("profile")
@@ -2215,66 +2227,78 @@ def _validate_setup_payload(data: dict):
     return keys, profile, providers, errors
 
 
-def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644):
-    """Write via tmp + os.replace, keeping the file's mode (new files get
-    ``default_mode``). Falls back to an in-place write if the target can't be
-    replaced (e.g. it is a single-file bind mount)."""
+def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644,
+                       clear_bits: int = 0):
+    """Write via tmp + os.replace, keeping the file's mode minus ``clear_bits``
+    (new files get ``default_mode``). Falls back to an in-place write if the
+    target can't be replaced (e.g. it is a single-file bind mount)."""
     try:
-        mode = path.stat().st_mode & 0o777
+        mode = path.stat().st_mode & 0o777 & ~clear_bits
     except FileNotFoundError:
         mode = default_mode
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w") as f:
-        f.write(content)
-    os.chmod(tmp, mode)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
-        os.replace(tmp, path)
-    except OSError:
-        os.unlink(tmp)
-        with open(path, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        os.chmod(tmp, mode)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            os.unlink(tmp)
+            fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+            try:
+                os.fchmod(fd, mode)  # may be refused on a bind mount
+            except OSError:
+                pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _update_env_file(path: Path, updates: dict):
-    """Set KEY=value lines in a .env file, preserving comments and order."""
-    lines = []
+    """Set KEY=value in a .env file, keeping every other line as it was
+    (line endings are normalised to LF).
+
+    Bindings are found with python-dotenv's own parser, so a key matches
+    exactly as the loaders read it: a whole binding is replaced (including a
+    quoted multi-line value), and later duplicates, which the loaders would
+    read instead, are dropped. Call with _SETUP_WRITE_LOCK held.
+    """
     if path.exists():
-        with open(path) as f:
-            lines = f.read().splitlines()
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
     else:
-        lines = [
-            "# Obsidian Engine — Environment Configuration",
-            "# Auto-saved by Setup Wizard",
-            "",
-        ]
-    remaining = dict(updates)
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
+        text = ("# Obsidian Engine — Environment Configuration\n"
+                "# Auto-saved by Setup Wizard\n\n")
+    out, written = [], set()
+    for binding in parse_stream(io.StringIO(text)):
+        key = binding.key
+        if key in updates and not binding.error:
+            # the parser folds blank lines before a binding into it; keep them
+            raw = binding.original.string
+            lead = raw[:len(raw) - len(raw.lstrip())]
+            out.append(lead[:lead.rfind("\n") + 1])
+            if key not in written:
+                out.append(f"{key}={updates[key]}\n")
+                written.add(key)
             continue
-        k = stripped.split("=", 1)[0].strip()
-        if k.startswith("export "):
-            k = k[len("export "):].strip()
-        if k in remaining:
-            lines[i] = f"{k}={remaining.pop(k)}"
-    for k, v in remaining.items():
-        lines.append(f"{k}={v}")
-    _atomic_write_text(path, "\n".join(lines) + "\n", default_mode=0o600)
+        out.append(binding.original.string)
+    rest = [f"{k}={v}\n" for k, v in updates.items() if k not in written]
+    if rest and out and not out[-1].endswith("\n"):
+        out.append("\n")
+    _atomic_write_text(path, "".join(out + rest), default_mode=0o600, clear_bits=0o007)
 
 
 def _read_env_value(path: Path, key: str) -> str:
+    """Value of key in a .env file, parsed exactly as the loaders parse it."""
     if not path.exists():
         return ""
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            if k.strip() == key:
-                return v.strip().strip('"').strip("'")
-    return ""
+    return (dotenv_values(path, interpolate=False).get(key) or "").strip()
 
 
 _YAML_KV_RE = re.compile(r"^(?P<prefix>[ \t]*[A-Za-z0-9_]+:[ \t]*)(?P<value>.*?)(?P<comment>[ \t]+#.*)?$")
@@ -2369,46 +2393,54 @@ def api_setup_save():
         _audit(ip, "SETUP_REJECTED", "; ".join(errors))
         return jsonify({"saved": [], "errors": errors, "success": False}), 400
 
-    # First run (no TRIGGER_KEY yet): adopt one already in .env, or mint one.
-    generated_key = None
-    env_updates = dict(keys_to_save)
-    if not TRIGGER_KEY:
-        existing = _read_env_value(ENV_PATH, "TRIGGER_KEY")
-        if existing:
-            TRIGGER_KEY = existing
-            os.environ["TRIGGER_KEY"] = existing
-        else:
+    with _SETUP_WRITE_LOCK:
+        # Adopt a key already in .env (written by hand or by another save),
+        # then require it: a request admitted as first run must present the
+        # key once one exists.
+        if not TRIGGER_KEY:
+            existing = _read_env_value(ENV_PATH, "TRIGGER_KEY")
+            if existing:
+                TRIGGER_KEY = existing
+                os.environ["TRIGGER_KEY"] = existing
+        if TRIGGER_KEY and not _check_key():
+            _audit(ip, "AUTH_FAILED", request.path)
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # Still no key: this is the first run, so mint one.
+        generated_key = None
+        env_updates = dict(keys_to_save)
+        if not TRIGGER_KEY:
             generated_key = secrets.token_urlsafe(32)
             env_updates["TRIGGER_KEY"] = generated_key
 
-    # Save API keys (and generated TRIGGER_KEY) to .env
-    if env_updates:
-        try:
-            _update_env_file(ENV_PATH, env_updates)
-            for k, v in keys_to_save.items():
-                os.environ[k] = v  # also apply to the running process
-                saved.append(k)
-            if generated_key:
-                os.environ["TRIGGER_KEY"] = generated_key
-                TRIGGER_KEY = generated_key
-                _audit(ip, "TRIGGER_KEY_GENERATED", "first-run setup wizard")
-        except Exception as e:
-            generated_key = None
-            errors.append(f"Failed to save .env: {e}")
+        # Save API keys (and generated TRIGGER_KEY) to .env
+        if env_updates:
+            try:
+                _update_env_file(ENV_PATH, env_updates)
+                for k, v in keys_to_save.items():
+                    os.environ[k] = v  # also apply to the running process
+                    saved.append(k)
+                if generated_key:
+                    os.environ["TRIGGER_KEY"] = generated_key
+                    TRIGGER_KEY = generated_key
+                    _audit(ip, "TRIGGER_KEY_GENERATED", "first-run setup wizard")
+            except Exception as e:
+                generated_key = None
+                errors.append(f"Failed to save .env: {e}")
 
-    # Save profile / providers to obsidian.yaml (targeted edits keep comments)
-    if profile or providers_config:
-        try:
-            content = CONFIG_YAML_PATH.read_text()
-            if profile:
-                content = _yaml_set_profile(content, profile)
-                saved.append(f"profile={profile}")
-            for ptype, pname in providers_config.items():
-                content = _yaml_set_provider(content, ptype, pname)
-                saved.append(f"providers.{ptype}={pname}")
-            _atomic_write_text(CONFIG_YAML_PATH, content)
-        except Exception as e:
-            errors.append(f"Failed to save obsidian.yaml: {e}")
+        # Save profile / providers to obsidian.yaml (targeted edits keep comments)
+        if profile or providers_config:
+            try:
+                content = CONFIG_YAML_PATH.read_text(encoding="utf-8")
+                if profile:
+                    content = _yaml_set_profile(content, profile)
+                    saved.append(f"profile={profile}")
+                for ptype, pname in providers_config.items():
+                    content = _yaml_set_provider(content, ptype, pname)
+                    saved.append(f"providers.{ptype}={pname}")
+                _atomic_write_text(CONFIG_YAML_PATH, content)
+            except Exception as e:
+                errors.append(f"Failed to save obsidian.yaml: {e}")
 
     _audit(ip, "SETUP_SAVED", ", ".join(saved) or "(nothing)")
     resp = {

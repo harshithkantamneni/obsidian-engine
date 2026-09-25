@@ -2,10 +2,13 @@
 
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from dotenv import dotenv_values
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -146,12 +149,196 @@ class TestSetupSave:
         r = self._save(client, {"keys": {"TRIGGER_KEY": "attacker"}})
         assert r.status_code == 400
 
-    @pytest.mark.parametrize("bad", ["abc\nTRIGGER_KEY=x", "abc\rdef", "abc\x00def"])
-    def test_rejects_newline_and_nul_values(self, client, with_key, setup_files, bad):
+    @pytest.mark.parametrize("bad", [
+        "abc\nTRIGGER_KEY=x", "abc\rdef", "abc\x00def",
+        "abc\x0bdef", "abc\x0cdef", "abc\x1cdef", "abc\x1ddef", "abc\x1edef",
+        "abc\x85def", "abc\u2028def", "abc\u2029def",
+        "${OTHER}", "abc${OTHER}", "abc$def", "abc def", "abc\tdef", "caf\u00e9",
+        '"abc', "'abc", "abc\"", 'a\\nb', "a`b`", pytest.param("x" * 4097, id="4097-chars"),
+        # at either end too, not just in the middle
+        "\x0babc", "abc\x0c", "\x1cabc", "abc\x85", "\u2028abc", "abc\u2029",
+    ])
+    def test_rejects_values_outside_printable_ascii(self, client, with_key, setup_files, bad):
         env_path, _ = setup_files
         r = self._save(client, {"keys": {"FAL_KEY": bad}})
         assert r.status_code == 400
         assert not env_path.exists()
+
+    @pytest.mark.parametrize("good", [
+        "sk-proj-AbC_123", "https://abc.supabase.co", "eyJhbGciOi.eyJzdWIi.sig-_",
+        "-1001234567890", "fal:key/with+chars=", pytest.param("x" * 4096, id="4096-chars"),
+    ])
+    def test_accepts_printable_ascii_values(self, client, with_key, setup_files, good):
+        env_path, _ = setup_files
+        r = self._save(client, {"keys": {"FAL_KEY": good}})
+        assert r.status_code == 200, r.get_json()
+        assert f"FAL_KEY={good}\n" in env_path.read_text()
+
+    def test_value_charset_is_printable_ascii_minus_banned(self):
+        allowed = {chr(c) for c in range(0x21, 0x7F)} - set("$\"'\\`")
+        points = list(range(0x3000)) + [0xD800, 0xFEFF, 0xFF04, 0x1F600, 0xE0001, 0x10FFFF]
+        for cp in points:
+            ch = chr(cp)
+            keys, _, _, errors = ws._validate_setup_payload({"keys": {"FAL_KEY": "a" + ch + "b"}})
+            assert (not errors) == (ch in allowed), f"U+{cp:04X}"
+            if not errors:
+                assert keys == {"FAL_KEY": "a" + ch + "b"}
+
+    @pytest.mark.parametrize("value", ["", "   ", "\t\r\n"])
+    def test_empty_values_leave_env_untouched(self, client, with_key, setup_files, value):
+        env_path, _ = setup_files
+        r = self._save(client, {"keys": {"FAL_KEY": value}})
+        assert r.status_code == 200, r.get_json()
+        assert not env_path.exists()
+
+    @pytest.mark.parametrize("value", ["#abc", "abc#x", "=x", "a=b", "export", "FAL_KEY=x",
+                                       "TRIGGER_KEY=x", "a/b+c:d@e,f;g<h>i?j[k]l{m}n|o~p"])
+    def test_saved_values_load_back_exactly(self, client, with_key, setup_files, value):
+        env_path, _ = setup_files
+        env_path.write_text("A=1\nB=two\n")
+        r = self._save(client, {"keys": {"FAL_KEY": value}})
+        assert r.status_code == 200, r.get_json()
+        assert dotenv_values(env_path, interpolate=False) == {"A": "1", "B": "two", "FAL_KEY": value}
+
+    @pytest.mark.parametrize("before", [
+        "FAL_KEY=old1\nB=2\nFAL_KEY=old2\n",
+        "FAL_KEY=old1\nB=2\nexport\tFAL_KEY=old2\n",
+        "FAL_KEY=old1\nB=2\n'FAL_KEY'=old2\n",
+    ], ids=["duplicate", "export-tab", "quoted-key"])
+    def test_save_replaces_every_binding_of_the_key(self, client, with_key, setup_files, before):
+        env_path, _ = setup_files
+        env_path.write_text(before)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        assert env_path.read_text() == "FAL_KEY=new\nB=2\n"
+        assert dotenv_values(env_path, interpolate=False) == {"FAL_KEY": "new", "B": "2"}
+
+    def test_save_replaces_a_multiline_value_as_one_binding(self, client, with_key, setup_files):
+        env_path, _ = setup_files
+        env_path.write_text('FAL_KEY="abc\nOTHER=x"\nB=2\n')
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        assert dotenv_values(env_path, interpolate=False) == {"FAL_KEY": "new", "B": "2"}
+
+    def test_save_leaves_lines_inside_other_values_alone(self, client, with_key, setup_files):
+        env_path, _ = setup_files
+        env_path.write_text('N="first\nFAL_KEY=inside\nlast"\nB=2\n')
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        values = dotenv_values(env_path, interpolate=False)
+        assert values == {"N": "first\nFAL_KEY=inside\nlast", "B": "2", "FAL_KEY": "new"}
+
+    def test_concurrent_saves_are_serialized(self, with_key, setup_files, monkeypatch):
+        env_path, _ = setup_files
+        real_write = ws._atomic_write_text
+        state = {"active": 0, "peak": 0}
+        guard = threading.Lock()
+
+        def slow_write(*args, **kwargs):
+            with guard:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)
+            try:
+                return real_write(*args, **kwargs)
+            finally:
+                with guard:
+                    state["active"] -= 1
+
+        monkeypatch.setattr(ws, "_atomic_write_text", slow_write)
+        statuses = []
+
+        def save(value):
+            with ws.app.test_client() as c:
+                statuses.append(self._save(c, {"keys": {"FAL_KEY": value}}).status_code)
+
+        threads = [threading.Thread(target=save, args=(f"v{i}",)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert statuses == [200] * 4
+        assert state["peak"] == 1
+        values = dotenv_values(env_path, interpolate=False)
+        assert list(values) == ["FAL_KEY"] and values["FAL_KEY"] in {"v0", "v1", "v2", "v3"}
+
+    def test_atomic_write_uses_a_unique_temp_file(self, client, with_key, setup_files):
+        env_path, _ = setup_files
+        (env_path.parent / (env_path.name + ".tmp")).mkdir()  # the old fixed temp name
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        assert dotenv_values(env_path, interpolate=False) == {"FAL_KEY": "new"}
+        assert sorted(p.name for p in env_path.parent.iterdir()) == [".env", ".env.tmp", "obsidian.yaml"]
+
+    @pytest.mark.parametrize("before, after", [
+        ("A=1\n\nFAL_KEY=old\nB=2\n", "A=1\n\nFAL_KEY=new\nB=2\n"),
+        ("A=1\n\n\n\tFAL_KEY=old\n", "A=1\n\n\nFAL_KEY=new\n"),
+        ("FAL_KEY=a\n\n\nB=2\n\nFAL_KEY=b\n", "FAL_KEY=new\n\n\nB=2\n\n"),
+    ], ids=["blank-before", "blank-and-indent", "blank-before-duplicate"])
+    def test_save_keeps_blank_lines(self, client, with_key, setup_files, before, after):
+        env_path, _ = setup_files
+        env_path.write_text(before)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        assert env_path.read_text() == after
+
+    def test_resaving_a_wizard_created_env_keeps_its_header(self, client, with_key, setup_files):
+        env_path, _ = setup_files
+        assert self._save(client, {"keys": {"FAL_KEY": "one"}}).status_code == 200
+        first = env_path.read_text()
+        assert self._save(client, {"keys": {"FAL_KEY": "two"}}).status_code == 200
+        assert env_path.read_text() == first.replace("FAL_KEY=one", "FAL_KEY=two")
+
+    def test_env_is_never_readable_by_others(self, client, with_key, setup_files):
+        env_path, yaml_path = setup_files
+        yaml_path.chmod(0o644)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}, "providers": {"llm": "openai"}})
+        assert r.status_code == 200, r.get_json()
+        assert env_path.stat().st_mode & 0o777 == 0o600
+        assert yaml_path.stat().st_mode & 0o777 == 0o644
+        for before, after in ((0o640, 0o640), (0o644, 0o640), (0o666, 0o660)):
+            env_path.chmod(before)
+            assert self._save(client, {"keys": {"FAL_KEY": "newer"}}).status_code == 200
+            assert env_path.stat().st_mode & 0o777 == after
+
+    def test_failed_write_leaves_no_temp_file_and_original_intact(self, client, with_key,
+                                                                  setup_files, monkeypatch):
+        env_path, _ = setup_files
+        env_path.write_text("FAL_KEY=old\n")
+
+        def broken_fdopen(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ws.os, "fdopen", broken_fdopen)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.get_json()["success"] is False
+        assert env_path.read_text() == "FAL_KEY=old\n"
+        assert sorted(p.name for p in env_path.parent.iterdir()) == [".env", "obsidian.yaml"]
+
+    def test_in_place_fallback_when_replace_fails(self, client, with_key, setup_files, monkeypatch):
+        env_path, _ = setup_files
+        env_path.write_text("FAL_KEY=old\n")
+        env_path.chmod(0o644)
+        inode = env_path.stat().st_ino
+
+        def busy_replace(*args, **kwargs):
+            raise OSError(16, "Device or resource busy")
+
+        monkeypatch.setattr(ws.os, "replace", busy_replace)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        assert env_path.read_text() == "FAL_KEY=new\n"
+        assert env_path.stat().st_ino == inode
+        assert env_path.stat().st_mode & 0o777 == 0o640
+        assert sorted(p.name for p in env_path.parent.iterdir()) == [".env", "obsidian.yaml"]
+
+    def test_save_keeps_other_lines_byte_for_byte(self, client, with_key, setup_files):
+        env_path, _ = setup_files
+        original = "# note\nNOTE=a\u2028b\nPEM=line1\x0bline2\nFAL_KEY=old\n"
+        env_path.write_text(original)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.status_code == 200, r.get_json()
+        assert env_path.read_text() == original.replace("FAL_KEY=old", "FAL_KEY=new")
 
     def test_saves_allowed_key_stripped_and_keeps_comments(self, client, with_key, setup_files):
         env_path, _ = setup_files
@@ -229,6 +416,38 @@ class TestSetupSave:
         assert r2.status_code == 401
         r3 = client.get("/status", headers={"X-Trigger-Key": new_key}, environ_base=LOCAL)
         assert r3.status_code == 200
+
+    @pytest.mark.parametrize("line", ["export TRIGGER_KEY=kept-key", "TRIGGER_KEY=old\nTRIGGER_KEY=kept-key",
+                                      "TRIGGER_KEY=kept-key  # note"])
+    def test_first_run_adopts_existing_key_as_loaders_read_it(self, client, no_key, setup_files, line):
+        env_path, _ = setup_files
+        env_path.write_text(line + "\n")
+        r = client.post("/api/setup/save", json={"keys": {"FAL_KEY": "fal_abc"}}, environ_base=LOCAL)
+        assert r.status_code == 401  # the key exists now, so it must be presented
+        assert ws.TRIGGER_KEY == "kept-key"
+        assert "FAL_KEY" not in dotenv_values(env_path, interpolate=False)
+        r = client.post("/api/setup/save", json={"keys": {"FAL_KEY": "fal_abc"}},
+                        headers={"X-Trigger-Key": "kept-key"}, environ_base=LOCAL)
+        assert r.status_code == 200, r.get_json()
+        assert "trigger_key_generated" not in r.get_json()
+        values = dotenv_values(env_path, interpolate=False)
+        assert values["TRIGGER_KEY"] == "kept-key" and values["FAL_KEY"] == "fal_abc"
+
+    def test_first_run_request_needs_the_key_once_one_is_set(self, client, no_key,
+                                                             setup_files, monkeypatch):
+        """A request admitted as first run, whose save runs after another save
+        set a key, must present that key."""
+        env_path, _ = setup_files
+        real_validate = ws._validate_setup_payload
+
+        def key_set_meanwhile(data):
+            monkeypatch.setattr(ws, "TRIGGER_KEY", KEY)
+            return real_validate(data)
+
+        monkeypatch.setattr(ws, "_validate_setup_payload", key_set_meanwhile)
+        r = client.post("/api/setup/save", json={"keys": {"FAL_KEY": "fal_abc"}}, environ_base=LOCAL)
+        assert r.status_code == 401
+        assert not env_path.exists()
 
     def test_first_run_save_blocked_remotely(self, client, no_key, setup_files):
         env_path, _ = setup_files

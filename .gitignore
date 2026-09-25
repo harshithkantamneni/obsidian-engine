@@ -1,5 +1,7 @@
 # Secrets — must NEVER be committed
 .env
+.env.*
+!.env.example
 youtube_token.json
 client_secrets.json
 

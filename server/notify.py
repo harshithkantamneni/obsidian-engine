@@ -15,7 +15,7 @@ import requests
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", interpolate=False)
 WEBHOOK_URL   = os.getenv("DISCORD_WEBHOOK_URL", "")
 TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")

@@ -22,7 +22,7 @@ from intel import youtube_growth
 from core.json_compat import apply_lenient_json
 apply_lenient_json()
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", interpolate=False)
 sys.path.append(str(Path(__file__).parent))
 
 # Allow OAuth over HTTP on Railway (internal proxy handles HTTPS externally)

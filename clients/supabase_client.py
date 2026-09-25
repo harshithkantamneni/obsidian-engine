@@ -8,7 +8,7 @@ import threading
 from dotenv import load_dotenv
 from pathlib import Path
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", interpolate=False)
 
 
 def _with_retry(fn, max_retries=3, base_delay=1.0):
