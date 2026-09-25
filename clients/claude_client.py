@@ -1,10 +1,18 @@
 """
-Shared Claude API client with model routing.
-- Sonnet 4.6: creative, analytical, judgment-based agents
-- Haiku 4.5:  mechanical, formatting, classification agents
+Shared LLM entry point with model routing.
+- Opus / "premium": creative writing
+- Sonnet / "full":  analytical, judgment-based agents
+- Haiku / "light":  mechanical, formatting, classification agents
+
+call_claude() / call_claude_with_search() are the single entry point every
+agent uses. With the default ``providers.llm.name: anthropic`` they call the
+Anthropic API directly (see _anthropic_call). With any other LLM provider
+(built-in "openai" or a custom ``module.ClassName``) they dispatch to
+``provider.generate()`` / ``provider.generate_with_search()``, mapping the
+Claude model id to a tier ("premium" / "full" / "light") that the provider
+resolves via ``resolve_model()``.
 """
 
-import anthropic
 import copy
 import random
 import threading
@@ -37,7 +45,34 @@ except Exception:
     SONNET = "claude-sonnet-4-6"
     HAIKU  = "claude-haiku-4-5-20251001"
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+class _LazyAnthropicClient:
+    """Module-level ``client`` that only builds anthropic.Anthropic on first use.
+
+    Users who bring their own LLM provider don't need ANTHROPIC_API_KEY (or
+    even the anthropic package) just to import this module. Existing code
+    that does ``from clients.claude_client import client`` keeps working, and
+    tests can still patch ``clients.claude_client.client``.
+    """
+
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._real = None
+
+    def _get(self):
+        if self._real is None:
+            with self._lock:
+                if self._real is None:
+                    import anthropic
+                    self._real = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        return self._real
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+
+client = _LazyAnthropicClient()
 
 # ── Cost tracking (thread-safe) ───────────────────────────────────────────────
 _PRICES = {  # USD per 1M tokens
@@ -82,6 +117,8 @@ def get_session_costs() -> dict:
 
 def reset_session_costs():
     """Reset the session cost accumulator (call at start of each pipeline run)."""
+    global _untracked_notice_logged
+    _untracked_notice_logged = False
     with _cost_lock:
         _session_costs["tokens"]    = {}
         _session_costs["usd_total"] = 0.0
@@ -243,7 +280,142 @@ def _repair_truncated_json(text: str):
     return result
 
 
+# ── Provider dispatch ─────────────────────────────────────────────────────────
+
+_untracked_notice_logged = False
+
+
+def model_tier(model: str | None) -> str:
+    """Map a Claude model id to a provider-neutral tier.
+
+    OPUS → "premium", SONNET → "full", HAIKU → "light", anything else → "full".
+    """
+    if not model:
+        return "full"
+    if model == OPUS:
+        return "premium"
+    if model == SONNET:
+        return "full"
+    if model == HAIKU:
+        return "light"
+    low = str(model).lower()
+    if "opus" in low:
+        return "premium"
+    if "haiku" in low:
+        return "light"
+    return "full"
+
+
+def _custom_llm_provider():
+    """Return the configured LLM provider, or None for the built-in Anthropic path.
+
+    If the provider config can't be read at all we assume the default
+    (Anthropic). A custom provider that fails to load raises — the user asked
+    for it, so a silent fallback to Anthropic would be wrong.
+    """
+    try:
+        from providers.registry import get_provider_name
+        name = get_provider_name("llm")
+    except Exception:
+        return None
+    if name == "anthropic":
+        return None
+    from providers.registry import get_provider
+    provider = get_provider("llm")
+    global _untracked_notice_logged
+    if not _untracked_notice_logged:
+        _untracked_notice_logged = True
+        print(f"[llm] Using LLM provider '{name}' ({getattr(provider, 'name', '?')}) — "
+              f"token usage/cost is not tracked for non-Anthropic providers, "
+              f"so the per-run budget cap does not apply to LLM spend.")
+    return provider
+
+
+def llm_is_anthropic() -> bool:
+    """True when LLM calls go to the built-in Anthropic provider."""
+    try:
+        from providers.registry import get_provider_name
+        return get_provider_name("llm") == "anthropic"
+    except Exception:
+        return True
+
+
+def anthropic_vision_available() -> bool:
+    """True if Claude vision calls (image scoring) can be made.
+
+    Vision scoring is an Anthropic-specific feature: it runs only when the LLM
+    provider is the built-in "anthropic" and ANTHROPIC_API_KEY is set.
+    """
+    return llm_is_anthropic() and bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
 def call_claude(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = SONNET,
+    max_tokens: int = 4000,
+    expect_json: bool = True,
+    output_schema: dict | None = None,
+) -> object:
+    """
+    Call the configured LLM and return parsed JSON or raw text.
+
+    Default (providers.llm.name: anthropic): Claude via the Anthropic API.
+    Otherwise: ``provider.generate()`` with model=provider.resolve_model(tier).
+    """
+    provider = _custom_llm_provider()
+    if provider is None:
+        return _anthropic_call(system_prompt, user_prompt, model, max_tokens,
+                               expect_json, output_schema)
+    result = provider.generate(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        model=provider.resolve_model(model_tier(model)),
+        max_tokens=max_tokens,
+        expect_json=expect_json,
+        output_schema=output_schema,
+    )
+    if expect_json and isinstance(result, str):
+        parsed = _parse_json_robust(result)
+        if parsed is None:
+            raise json.JSONDecodeError(
+                f"Could not parse JSON from LLM provider response ({len(result)} chars)",
+                result[:200], 0,
+            )
+        return parsed
+    return result
+
+
+def call_claude_with_search(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = SONNET,
+    max_tokens: int = 4000,
+    output_schema: dict | None = None,
+) -> str:
+    """
+    Call the configured LLM with web search enabled. Returns raw text.
+
+    Default: Claude with the web_search tool. Otherwise:
+    ``provider.generate_with_search()`` (providers without search may fall
+    back to plain generation).
+    """
+    provider = _custom_llm_provider()
+    if provider is None:
+        return _anthropic_call_with_search(system_prompt, user_prompt, model,
+                                           max_tokens, output_schema)
+    return provider.generate_with_search(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        model=provider.resolve_model(model_tier(model)),
+        max_tokens=max_tokens,
+        output_schema=output_schema,
+    )
+
+
+# ── Anthropic implementation (built-in "anthropic" provider) ─────────────────
+
+def _anthropic_call(
     system_prompt: str,
     user_prompt: str,
     model: str = SONNET,
@@ -320,7 +492,7 @@ def call_claude(
     if getattr(response, "stop_reason", None) == "max_tokens" and max_tokens < 16000:
         bumped = min(max_tokens * 2, 16000)
         print(f"[claude_client] Response truncated at {max_tokens} tokens — retrying with {bumped}...")
-        return call_claude(system_prompt, user_prompt, model, max_tokens=bumped, expect_json=True, output_schema=output_schema)
+        return _anthropic_call(system_prompt, user_prompt, model, max_tokens=bumped, expect_json=True, output_schema=output_schema)
 
     # When schema is provided, API guarantees valid JSON — skip _parse_json_robust
     if output_schema is not None:
@@ -336,7 +508,7 @@ def call_claude(
     )
 
 
-def call_claude_with_search(
+def _anthropic_call_with_search(
     system_prompt: str,
     user_prompt: str,
     model: str = SONNET,
