@@ -60,6 +60,7 @@ def _md_escape(text: str) -> str:
 def _atomic_write_json(path: Path, data: dict):
     """Write JSON atomically via temp file + rename to prevent corruption."""
     import tempfile
+    path = Path(path).resolve()  # follow symlinks into the Docker ./data mount
     tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(tmp_fd, "w") as f:
@@ -1179,6 +1180,8 @@ def _run_one_video_inner():
                         state = json.load(_sf)
                     upload_data = state.get("stage_13") or {}
                     video_id = upload_data.get("video_id", "")
+                    if upload_data.get("provider", "youtube") != "youtube":
+                        video_id = None  # saved locally / custom uploader — no YouTube follow-ups
                     seo_data = state.get("stage_6") or {}
                     verification_data = state.get("stage_5") or {}
 
@@ -1191,7 +1194,7 @@ def _run_one_video_inner():
                             print(f"[Scheduler] Pin comment failed (non-critical): {e}")
 
                     # Post shorts teaser if a short was also uploaded
-                    short_url = (state.get("short_upload") or {}).get("url", "")
+                    short_url = (state.get("stage_short_upload") or state.get("short_upload") or {}).get("url", "")
                     if short_url and video_id:
                         try:
                             title = seo_data.get("recommended_title", topic)
@@ -1293,7 +1296,7 @@ def check_ab_titles():
 
             upload = state.get("stage_13") or {}
             video_id = upload.get("video_id", "")
-            if not video_id:
+            if not video_id or upload.get("provider", "youtube") != "youtube":
                 continue
 
             # Check upload age -- prefer uploaded_at from state, fall back to file mtime
@@ -1633,7 +1636,26 @@ def run_daemon():
             print(f"[Scheduler] Post-upload task check error: {e}")
         time.sleep(60)
 
+def _warn_if_youtube_upload_disabled():
+    """Warn when YouTube credentials exist but uploads go elsewhere.
+
+    Since uploads honour providers.upload.name (default: local), an existing
+    YouTube deployment that never set it would silently stop publishing.
+    """
+    try:
+        from providers.registry import get_provider_name
+        has_token = bool(os.getenv("YOUTUBE_TOKEN_JSON")) or (Path(__file__).parent / "youtube_token.json").exists()
+        name = get_provider_name("upload")
+        if has_token and name != "youtube":
+            print(f"[Scheduler] WARNING: YouTube credentials found but providers.upload.name is "
+                  f"'{name}' — videos will NOT be published to YouTube. Set "
+                  f"providers.upload.name: youtube in obsidian.yaml to publish.")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _warn_if_youtube_upload_disabled()
     if "--discover" in sys.argv:
         discover_topics()
     elif "--once" in sys.argv:

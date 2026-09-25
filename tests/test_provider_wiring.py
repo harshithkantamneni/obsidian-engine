@@ -267,7 +267,7 @@ class TestTTSProviders:
         monkeypatch.setattr("requests.post", post)
         path, words = p.synthesize("Hi you", voice_settings={"stability": 0.4}, speed=0.8)
         payload = post.call_args.kwargs["json"]
-        assert payload["speed"] == 0.8 and payload["voice_settings"]["speed"] == 0.8
+        assert payload["speed"] == 0.8 and "speed" not in payload["voice_settings"]  # payload identical to pre-refactor pipeline
         assert payload["model_id"]  # from cfg.voice.model
         assert [w["word"] for w in words] == ["Hi", "you"]
         path.unlink()

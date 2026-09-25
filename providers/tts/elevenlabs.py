@@ -143,8 +143,10 @@ class ElevenLabsProvider(TTSProvider):
         if voice_settings is None:
             from core.config import cfg
             voice_settings = cfg.voice.body.to_dict()
+        # Pass voice_settings through unchanged (the scene-aware pipeline already
+        # puts its tuned speed in there); don't add one, so legacy/shorts payloads
+        # stay identical to what the pipeline sent before the provider refactor.
         vs = dict(voice_settings)
-        vs.setdefault("speed", speed)
 
         payload = {
             "text": text,

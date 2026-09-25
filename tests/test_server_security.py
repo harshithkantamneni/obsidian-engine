@@ -342,3 +342,48 @@ class TestMisc:
         prof = _load_profile("../obsidian")
         doc = _load_profile("documentary")
         assert prof == doc
+
+
+# ── DNS rebinding / cross-site POST ──────────────────────────────────────────
+
+EVIL_BASE = "http://evil.example:8080"
+
+
+class TestRebindingAndCrossSite:
+    def test_first_run_save_rejected_for_foreign_host(self, client, no_key, setup_files):
+        env_path, _ = setup_files
+        r = client.post("/api/setup/save", json={"keys": {"FAL_KEY": "x"}},
+                        environ_base=LOCAL, base_url=EVIL_BASE)
+        assert r.status_code == 503
+        assert not env_path.exists()
+        assert ws.TRIGGER_KEY == ""
+
+    def test_dashboard_key_not_injected_for_foreign_host(self, client, with_key, monkeypatch):
+        monkeypatch.setattr(ws, "DASHBOARD_PASSWORD", "")
+        r = client.get("/", environ_base=LOCAL, base_url=EVIL_BASE)
+        assert KEY not in r.get_data(as_text=True)
+
+    @pytest.mark.parametrize("host", ["127.0.0.1:8080", "localhost", "[::1]:8080"])
+    def test_loopback_hosts_still_trusted(self, client, with_key, monkeypatch, host):
+        monkeypatch.setattr(ws, "DASHBOARD_PASSWORD", "")
+        r = client.get("/", environ_base=LOCAL, base_url=f"http://{host}")
+        assert KEY in r.get_data(as_text=True)
+
+    def test_text_plain_post_rejected(self, client, no_key, setup_files):
+        env_path, _ = setup_files
+        r = client.post("/api/setup/save", data="{}", content_type="text/plain",
+                        environ_base=LOCAL)
+        assert r.status_code == 403
+        assert not env_path.exists()
+
+    def test_cross_origin_post_rejected(self, client, with_key, setup_files):
+        r = client.post("/api/setup/save", json={"keys": {"FAL_KEY": "x"}},
+                        headers={"X-Trigger-Key": KEY, "Origin": "https://evil.example"},
+                        environ_base=LOCAL)
+        assert r.status_code == 403
+
+    def test_same_origin_post_allowed(self, client, with_key, setup_files):
+        r = client.post("/api/setup/save", json={"keys": {"FAL_KEY": "x"}},
+                        headers={"X-Trigger-Key": KEY, "Origin": "http://localhost"},
+                        environ_base=LOCAL)
+        assert r.status_code == 200, r.get_json()

@@ -244,9 +244,40 @@ _KEY_NOT_CONFIGURED_MSG = (
 )
 
 
+def _request_hostname() -> str:
+    """Hostname from the Host header, without port or IPv6 brackets."""
+    host = (request.host or "").strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
 def _is_loopback() -> bool:
-    """True if the request originates from this machine."""
-    return (request.remote_addr or "") in _LOOPBACK_ADDRS
+    """True if the request comes from this machine AND was addressed to it.
+
+    Checking the Host header as well as the peer address blocks DNS-rebinding:
+    a malicious site that re-resolves its domain to 127.0.0.1 still sends
+    ``Host: evil.example`` and is not trusted.
+    """
+    if (request.remote_addr or "") not in _LOOPBACK_ADDRS:
+        return False
+    return _request_hostname() in _LOOPBACK_HOSTS
+
+
+def _same_origin_json_post() -> bool:
+    """True for a JSON POST whose Origin (if sent) is this server.
+
+    Browsers can send cross-site ``text/plain`` POSTs without a preflight;
+    requiring application/json forces a preflight, and the Origin check
+    rejects cross-site pages outright.
+    """
+    if not request.is_json:
+        return False
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True  # non-browser client (curl, scripts)
+    from urllib.parse import urlparse
+    return urlparse(origin).netloc.lower() == (request.host or "").lower()
 
 
 def _check_key(allow_query: bool = False) -> bool:
@@ -2245,6 +2276,8 @@ def _yaml_set_provider(content: str, ptype: str, pname: str) -> str:
 def api_setup_save():
     """Save setup configuration to .env and obsidian.yaml."""
     global TRIGGER_KEY
+    if not _same_origin_json_post():
+        return jsonify({"error": "Setup save requires a same-origin JSON request"}), 403
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         data = {}

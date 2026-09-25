@@ -2,7 +2,18 @@
 
 ## Overview
 The container runs `scheduler.py --daemon` continuously, producing videos on
-schedule and uploading them to YouTube. The scheduler also starts the Flask
+schedule and handing them to the configured upload provider. **Publishing to
+YouTube is opt-in:** the default `providers.upload.name` in `obsidian.yaml` is
+`local`, which saves finished videos to `outputs/final/`. To publish, set:
+
+```yaml
+providers:
+  upload:
+    name: youtube
+```
+
+and complete Step 1a below. The scheduler logs a warning at startup if it finds
+YouTube credentials while the upload provider isn't `youtube`. The scheduler also starts the Flask
 dashboard/control API (`server/webhook_server.py`) on port **8080** (`PORT`),
 which serves the dashboard at `/`, the health check at `/health`, and the
 key-protected control endpoints (`/trigger`, `/kill`, `/api/setup/*`, ...).

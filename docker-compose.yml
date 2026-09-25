@@ -6,8 +6,9 @@ version: "3.8"
 #   docker compose up -d --build
 #
 # Runtime state (channel_insights.json, lessons_learned.json) is kept in ./data.
-# For YouTube upload, put client_secrets.json and youtube_token.json in ./data/
-# (or set YOUTUBE_TOKEN_JSON in .env).
+# Uploads default to `local` (saved to ./outputs/final). To publish to YouTube,
+# set `providers.upload.name: youtube` in obsidian.yaml, then put
+# client_secrets.json and youtube_token.json in ./data/ (or set YOUTUBE_TOKEN_JSON in .env).
 #
 # The container runs as an unprivileged user (uid 1000 by default). On Linux,
 # if your host uid differs, build with: APP_UID=$(id -u) APP_GID=$(id -g) docker compose up -d --build
