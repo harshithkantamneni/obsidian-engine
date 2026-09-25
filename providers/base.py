@@ -1,14 +1,31 @@
 """
 Abstract base classes for all provider types.
 
-To create a custom provider:
-1. Subclass the relevant base class
-2. Implement all abstract methods
-3. Register it in obsidian.yaml under providers.*
+Every external service the pipeline talks to (LLM, TTS, images, stock footage,
+upload, music, SFX) goes through one of these interfaces, so you can bring
+your own provider without touching pipeline code:
+
+1. Subclass the relevant base class (e.g. ``TTSProvider``) in any module that
+   is importable from the project root (e.g. ``my_providers/tts.py``).
+2. Implement every ``@abstractmethod``. The non-abstract helpers
+   (``resolve_model``, ``resolve_voice``, ``generate_with_reference``,
+   ``sfx_for_scene`` ...) have sensible defaults and are optional.
+3. Point obsidian.yaml at it::
+
+       providers:
+         tts:
+           name: my_providers.tts.MyTTS    # dotted path to the class
+           options:                        # passed to MyTTS(**options)
+             voice: narrator-1
+
+4. Run ``python -m providers`` to check that everything loads.
+
+See docs/PROVIDERS.md for the full contract of each type.
 """
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -59,6 +76,18 @@ class LLMProvider(ABC):
     def estimate_cost(self, input_tokens: int, output_tokens: int, model: str | None = None) -> float:
         """Estimate cost in USD for a given token count."""
 
+    def resolve_model(self, tier: str) -> str | None:
+        """Map a pipeline quality tier to a model id for this provider.
+
+        The pipeline asks for one of three tiers: ``"premium"`` (creative
+        writing), ``"full"`` (reasoning/analysis) or ``"light"`` (formatting,
+        classification). Return ``None`` to let ``generate()`` use its default.
+
+        Default: look the tier up in ``self.models`` (a dict) if the provider
+        defines one, e.g. from an ``options: {models: {...}}`` block.
+        """
+        return (getattr(self, "models", None) or {}).get(tier)
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -87,6 +116,10 @@ class TTSProvider(ABC):
         Returns:
             Tuple of (audio_file_path, word_timestamps).
             word_timestamps: list of {"word": str, "start": float, "end": float}
+            (seconds from the start of this clip). Return [] if the service
+            has no timing data: the pipeline then runs forced alignment
+            (Whisper, if installed) or spreads words evenly.
+            Any audio format ffmpeg can read is fine; non-MP3 is transcoded.
         """
 
     @abstractmethod
@@ -100,8 +133,20 @@ class TTSProvider(ABC):
     def check_credits(self) -> dict:
         """Check remaining credits/quota.
 
-        Returns {"remaining": int, "limit": int, "unit": str}
+        Returns {"remaining": int, "limit": int, "unit": str}.
+        Return -1 for remaining/limit when the service has no quota endpoint.
         """
+
+    def resolve_voice(self, role: str) -> str | None:
+        """Map a narration role to a voice id for this provider.
+
+        ``role`` is ``"narrator"`` (main voice) or ``"quote"`` (quoted
+        historical speech). Return ``None`` to let ``synthesize()`` use its
+        default voice.
+
+        Default: look the role up in ``self.voices`` (a dict) if defined.
+        """
+        return (getattr(self, "voices", None) or {}).get(role)
 
     @property
     @abstractmethod
@@ -131,8 +176,27 @@ class ImageProvider(ABC):
             seed: Random seed for reproducibility
 
         Returns:
-            Path to the generated image file.
+            Path to the generated image file (JPEG or PNG). The pipeline
+            copies it into place, so a temp file is fine.
         """
+
+    #: Set to True if ``generate_with_reference`` is implemented. The pipeline
+    #: then uses character reference portraits for visual consistency.
+    supports_reference_images: bool = False
+
+    def generate_with_reference(
+        self,
+        prompt: str,
+        reference_image: Path,
+        width: int = 1920,
+        height: int = 1080,
+        seed: int | None = None,
+    ) -> Path:
+        """Generate an image that keeps the subject of ``reference_image``.
+
+        Optional. Only called when ``supports_reference_images`` is True.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support reference images")
 
     @abstractmethod
     def estimate_cost(self) -> float:
@@ -164,7 +228,9 @@ class FootageProvider(ABC):
             max_results: Maximum results to return
 
         Returns:
-            List of {"url": str, "duration": int, "width": int, "height": int, "preview_url": str}
+            List of {"url": str, "duration": int, "width": int, "height": int,
+                     "preview_url": str, "credit": str (optional attribution)}
+            Best match first; the pipeline uses the first result's ``url``.
         """
 
     @abstractmethod
@@ -201,9 +267,15 @@ class MusicProvider(ABC):
                          total_duration: float) -> dict | None:
         """Select best track for a video.
 
+        ``scenes`` are the Remotion scenes (``mood``, ``start_time``,
+        ``end_time``, ``narrative_position`` ...).
+
         Returns {"music_file": str, "music_start_offset": float,
                  "track_id": str, "title": str, "bpm": int, "mood": str}
-        or None.
+        or None (the pipeline then falls back to the local library).
+        Only ``music_file`` is required. It may be a path relative to
+        ``remotion/public`` (e.g. ``"music/track.mp3"``) or an absolute path;
+        absolute paths are copied into ``remotion/public/music/``.
         """
 
     def check_status(self) -> dict:
@@ -235,6 +307,61 @@ class SFXProvider(ABC):
         """Check provider status."""
         return {"status": "available"}
 
+    # ── Scene-level helpers used by the pipeline (optional overrides) ────────
+
+    def sfx_for_scene(self, scene: dict, dest_dir: Path) -> str | None:
+        """Pick a one-shot sound effect for a key scene.
+
+        ``dest_dir`` is ``remotion/public/sfx``. Return a path relative to
+        ``remotion/public`` (e.g. ``"sfx/boom.mp3"``) or None.
+
+        Default: ``search()`` for a mood-based keyword and ``download()`` the
+        first hit into ``dest_dir``.
+        """
+        mood = (scene.get("mood") or "dramatic").lower()
+        keyword = scene.get("sfx_keyword") or f"{mood} cinematic impact"
+        return self._search_and_fetch(keyword, 5.0, dest_dir, "sfx")
+
+    def ambient_for_scene(self, scene: dict, dest_dir: Path) -> str | None:
+        """Pick a looping ambient bed for a scene.
+
+        ``dest_dir`` is ``remotion/public/ambience``. Return a path relative to
+        ``remotion/public`` (e.g. ``"ambience/wind.mp3"``) or None.
+
+        Default: ``search()`` for ``"<mood> ambience"`` and ``download()`` the
+        first hit into ``dest_dir``.
+        """
+        mood = (scene.get("mood") or "dark").lower()
+        keyword = scene.get("ambient_keyword") or f"{mood} ambience"
+        return self._search_and_fetch(keyword, 30.0, dest_dir, "amb")
+
+    def _search_and_fetch(self, keyword: str, duration_max: float,
+                          dest_dir: Path, prefix: str) -> str | None:
+        cache = self.__dict__.setdefault("_scene_audio_cache", {})
+        key = (prefix, keyword)
+        if key in cache:
+            return cache[key]
+        results = self.search(keyword=keyword, duration_max=duration_max)
+        if not results:
+            cache[key] = None
+            return None
+        item_id = str(results[0].get("id", ""))
+        safe = re.sub(r"[^a-z0-9]+", "_", f"{keyword}_{item_id}".lower()).strip("_")[:60]
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / f"{prefix}_{safe}.mp3"
+        if not out.exists():
+            got = Path(self.download(item_id, out) or out)
+            if got.exists() and got.resolve().parent != dest_dir.resolve():
+                import shutil
+                out = dest_dir / got.name
+                shutil.copy2(got, out)
+            else:
+                out = got
+        rel = f"{dest_dir.name}/{out.name}" if out.exists() else None
+        cache[key] = rel
+        return rel
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -264,6 +391,8 @@ class UploadProvider(ABC):
 
         Returns:
             {"video_id": str, "url": str, "status": str}
+            ``video_id`` must be non-empty: the pipeline treats an empty id
+            as a failed upload.
         """
 
     @property
