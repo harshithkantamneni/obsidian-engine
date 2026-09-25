@@ -1892,14 +1892,19 @@ _SETUP_API_KEYS = [
 ]
 
 
+def _config_yaml_path() -> Path:
+    """The config file the pipeline reads: OBSIDIAN_CONFIG if set (as in
+    core.config), else obsidian.yaml. The setup wizard reads and writes it."""
+    return Path(os.environ["OBSIDIAN_CONFIG"]) if os.getenv("OBSIDIAN_CONFIG") else CONFIG_YAML_PATH
+
+
 def _setup_providers_section() -> dict:
-    """The providers: block of obsidian.yaml, read from disk on every call.
+    """The providers: block of the config file, read from disk on every call.
 
     core.config.cfg is loaded once at import, so it does not see providers
-    written by /api/setup/save until the server restarts. Honors
-    OBSIDIAN_CONFIG like core.config, so this matches what the pipeline reads.
+    written by /api/setup/save until the server restarts.
     """
-    path = Path(os.environ["OBSIDIAN_CONFIG"]) if os.getenv("OBSIDIAN_CONFIG") else CONFIG_YAML_PATH
+    path = _config_yaml_path()
     try:
         import yaml
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -2227,6 +2232,36 @@ def _validate_setup_payload(data: dict):
     return keys, profile, providers, errors
 
 
+def _overwrite_fd(fd: int, data: bytes):
+    """Replace everything in the open file with data."""
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _write_in_place(path: Path, data: bytes, mode: int):
+    """Overwrite path in place, keeping its inode. If the write fails, the
+    old bytes are written back (best effort) before the error is raised."""
+    original = path.read_bytes()
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        try:
+            os.fchmod(fd, mode)  # may be refused on a bind mount
+        except OSError:
+            pass
+        try:
+            _overwrite_fd(fd, data)
+        except BaseException:
+            try:
+                _overwrite_fd(fd, original)
+            except OSError:
+                pass  # nothing more to try; the first error is the one to report
+            raise
+    finally:
+        os.close(fd)
+
+
 def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644,
                        clear_bits: int = 0):
     """Write via tmp + os.replace, keeping the file's mode minus ``clear_bits``
@@ -2245,13 +2280,7 @@ def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644,
             os.replace(tmp, path)
         except OSError:
             os.unlink(tmp)
-            fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
-            try:
-                os.fchmod(fd, mode)  # may be refused on a bind mount
-            except OSError:
-                pass
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_in_place(path, content.encode("utf-8"), mode)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -2428,19 +2457,20 @@ def api_setup_save():
                 generated_key = None
                 errors.append(f"Failed to save .env: {e}")
 
-        # Save profile / providers to obsidian.yaml (targeted edits keep comments)
+        # Save profile / providers to the config file (targeted edits keep comments)
         if profile or providers_config:
+            config_path = _config_yaml_path()
             try:
-                content = CONFIG_YAML_PATH.read_text(encoding="utf-8")
+                content = config_path.read_text(encoding="utf-8")
                 if profile:
                     content = _yaml_set_profile(content, profile)
                     saved.append(f"profile={profile}")
                 for ptype, pname in providers_config.items():
                     content = _yaml_set_provider(content, ptype, pname)
                     saved.append(f"providers.{ptype}={pname}")
-                _atomic_write_text(CONFIG_YAML_PATH, content)
+                _atomic_write_text(config_path, content)
             except Exception as e:
-                errors.append(f"Failed to save obsidian.yaml: {e}")
+                errors.append(f"Failed to save {config_path.name}: {e}")
 
     _audit(ip, "SETUP_SAVED", ", ".join(saved) or "(nothing)")
     resp = {
