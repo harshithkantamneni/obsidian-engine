@@ -16,7 +16,7 @@ Topic → Research(1) → Originality(2) → Narrative(3) → Script(4) → Scri
      → Footage(9) → Images(10) → Video(11) → QA(12) → Upload(13)
 ```
 
-**Core call chain:** `agents/*.py` → `core/agent_wrapper.py:call_agent()` → `clients/claude_client.py:call_claude()` → Anthropic API
+**Core call chain:** `agents/*.py` → `core/agent_wrapper.py:call_agent()` → `clients/claude_client.py:call_claude()` → configured LLM provider (Anthropic API by default)
 
 ### Key Files
 
@@ -73,30 +73,39 @@ Key functions: `core/profile.py` → `get_profile()`, `get_style_directive()`, `
 
 ### Provider System
 
-Swap any external service in `obsidian.yaml`:
+Every external-service call goes through the registry. Swap any service in `obsidian.yaml`, using a built-in name or a custom `module.path.ClassName`. `options:` are passed to the constructor as keyword arguments:
 ```yaml
 providers:
   llm:
-    name: anthropic    # or openai, or custom.module.ClassName
+    name: anthropic    # or openai, or my_pkg.module.ClassName
   tts:
-    name: elevenlabs   # or epidemic_sound, openai (PR pending)
+    name: elevenlabs   # or openai, epidemic_sound
   images:
     name: fal
   footage:
     name: pexels
   upload:
-    name: local
+    name: local        # or youtube (stage 13 honours this; default saves to outputs/final/)
   music:
     name: auto         # epidemic_sound, local, or auto
   sfx:
     name: auto
 ```
 
-Key functions: `providers/registry.py` → `get_provider("llm")`, `list_providers()`, `clear_cache()`
+Key functions: `providers/registry.py` → `get_provider("llm")`, `get_provider_name()` (resolves `auto`), `is_builtin()`, `list_providers()`, `clear_cache()`. Self-check: `python -m providers`. Guide for custom providers: `docs/PROVIDERS.md`; templates in `examples/providers/`.
 
-Built-in providers: `anthropic`, `openai`, `elevenlabs`, `epidemic_sound`, `fal`, `pexels`, `local`
+Built-in providers: `anthropic`, `openai`, `elevenlabs`, `epidemic_sound`, `fal`, `pexels`, `local`, `youtube`
 
 Provider types (7): `llm`, `tts`, `images`, `footage`, `upload`, `music`, `sfx`
+
+Where each provider is called:
+- **LLM:** `clients/claude_client.call_claude()`. When the provider is `anthropic` it calls `_anthropic_call` directly. Otherwise it calls `provider.generate(model=resolve_model(tier))`, where the tier comes from the model (OPUS→premium, SONNET→full, HAIKU→light).
+- **TTS:** `pipeline/audio.synthesize_chunk()`, used by long-form and Shorts audio. If the provider returns empty timestamps, words are aligned with forced alignment.
+- **Images:** `pipeline/images.py`, `pipeline/shorts.py` and `agents/thumbnail_agent.py`.
+- **Footage:** `agents/09_footage_hunter.search_stock_video()`.
+- **Upload:** `agents/11_youtube_uploader.run()` and the Shorts upload. Non-`youtube` providers skip the YouTube-only follow-ups.
+- **Music and SFX:** `pipeline/audio_assets.py`, called from `pipeline/convert.py`.
+- **Claude vision** (image and thumbnail scoring) only runs with the `anthropic` LLM. Otherwise images are accepted without scoring.
 
 ### Epidemic Sound Integration
 
@@ -229,7 +238,7 @@ Note: CI uses bare `python` (GitHub Actions), locally use `.venv/bin/python`. ~1
 - **Adding an API endpoint**: In `webhook_server.py`, use `@require_key` decorator, return `jsonify()`
 - **Adding structured output to an agent**: Add schema to `core/structured_schemas.py`, add to `SCHEMA_REGISTRY` (unless agent has multiple call patterns)
 - **Adding a content profile**: Copy `profiles/_template.yaml`, fill all sections, set `profile:` in `obsidian.yaml`. Tests auto-validate.
-- **Adding a provider**: Extend ABC from `providers/base.py`, register in `providers/registry.py` `_BUILTIN_PROVIDERS`, add tests in `tests/test_providers.py`
+- **Adding a provider**: Custom providers need no registration: extend the ABC in `providers/base.py` and set `providers.<type>.name: module.ClassName` (see `docs/PROVIDERS.md`). For a new *built-in*, also register it in `providers/registry.py` `_BUILTIN_PROVIDERS` and add tests in `tests/test_providers.py`
 - **Adding a music/SFX feature**: Use `clients/epidemic_client.py` (`_call_tool`) for API. Music: `music_manager.py` → `epidemic_music_manager.py`. SFX: `epidemic_sfx_manager.py`. Fallback chain: API → cached → local.
 - **Adding a music provider**: Extend `MusicProvider` from `providers/base.py`, register in `providers/registry.py`. Implement `search()`, `download()`, `select_for_video()`.
 - **Changing config defaults**: Edit `obsidian.yaml`, constants in `core/pipeline_config.py` will pick it up automatically
