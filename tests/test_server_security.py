@@ -65,6 +65,7 @@ def setup_files(tmp_path, monkeypatch):
     yaml_path.write_text(SAMPLE_YAML)
     monkeypatch.setattr(ws, "ENV_PATH", env_path)
     monkeypatch.setattr(ws, "CONFIG_YAML_PATH", yaml_path)
+    monkeypatch.delenv("OBSIDIAN_CONFIG", raising=False)  # else saves write the real config
     with patch.dict(os.environ):
         yield env_path, yaml_path
 
@@ -723,6 +724,21 @@ class TestSetupRequiredKeys:
         assert after["providers"]["llm"] == "openai"
         assert "OPENAI_API_KEY" in required
         assert "ANTHROPIC_API_KEY" not in required
+
+    def test_save_writes_the_obsidian_config_file(self, client, with_key, setup_files,
+                                                  monkeypatch, tmp_path):
+        _, yaml_path = setup_files
+        alt = tmp_path / "alt.yaml"
+        alt.write_text(SAMPLE_YAML)
+        monkeypatch.setenv("OBSIDIAN_CONFIG", str(alt))
+        hdr = {"X-Trigger-Key": KEY}
+        r = client.post("/api/setup/save", json={"providers": {"llm": "openai"}},
+                        headers=hdr, environ_base=LOCAL)
+        assert r.status_code == 200, r.get_json()
+        assert yaml_path.read_text() == SAMPLE_YAML
+        assert "name: openai" in alt.read_text()
+        status = client.get("/api/setup/status", headers=hdr, environ_base=LOCAL).get_json()
+        assert status["providers"]["llm"] == "openai"
 
     def test_saves_openai_key(self, client, with_key, setup_files):
         env_path, _ = setup_files

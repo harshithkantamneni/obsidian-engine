@@ -1892,14 +1892,19 @@ _SETUP_API_KEYS = [
 ]
 
 
+def _config_yaml_path() -> Path:
+    """The config file the pipeline reads: OBSIDIAN_CONFIG if set (as in
+    core.config), else obsidian.yaml. The setup wizard reads and writes it."""
+    return Path(os.environ["OBSIDIAN_CONFIG"]) if os.getenv("OBSIDIAN_CONFIG") else CONFIG_YAML_PATH
+
+
 def _setup_providers_section() -> dict:
-    """The providers: block of obsidian.yaml, read from disk on every call.
+    """The providers: block of the config file, read from disk on every call.
 
     core.config.cfg is loaded once at import, so it does not see providers
-    written by /api/setup/save until the server restarts. Honors
-    OBSIDIAN_CONFIG like core.config, so this matches what the pipeline reads.
+    written by /api/setup/save until the server restarts.
     """
-    path = Path(os.environ["OBSIDIAN_CONFIG"]) if os.getenv("OBSIDIAN_CONFIG") else CONFIG_YAML_PATH
+    path = _config_yaml_path()
     try:
         import yaml
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -2428,19 +2433,20 @@ def api_setup_save():
                 generated_key = None
                 errors.append(f"Failed to save .env: {e}")
 
-        # Save profile / providers to obsidian.yaml (targeted edits keep comments)
+        # Save profile / providers to the config file (targeted edits keep comments)
         if profile or providers_config:
+            config_path = _config_yaml_path()
             try:
-                content = CONFIG_YAML_PATH.read_text(encoding="utf-8")
+                content = config_path.read_text(encoding="utf-8")
                 if profile:
                     content = _yaml_set_profile(content, profile)
                     saved.append(f"profile={profile}")
                 for ptype, pname in providers_config.items():
                     content = _yaml_set_provider(content, ptype, pname)
                     saved.append(f"providers.{ptype}={pname}")
-                _atomic_write_text(CONFIG_YAML_PATH, content)
+                _atomic_write_text(config_path, content)
             except Exception as e:
-                errors.append(f"Failed to save obsidian.yaml: {e}")
+                errors.append(f"Failed to save {config_path.name}: {e}")
 
     _audit(ip, "SETUP_SAVED", ", ".join(saved) or "(nothing)")
     resp = {
