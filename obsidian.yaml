@@ -42,7 +42,13 @@ providers:
     #   options:
     #     default_model: gpt-4o
     #     models: {premium: gpt-4o, full: gpt-4o, light: gpt-4o-mini}
-    #     # base_url: http://localhost:11434/v1   # any OpenAI-compatible server
+    # Ollama or other OpenAI-compatible server example (setup: docs/PROVIDERS.md):
+    #   name: openai
+    #   options:
+    #     base_url: http://localhost:11434/v1   # Ollama needs no API key
+    #     # api_key_env: MY_SERVER_KEY          # remote server: otherwise OPENAI_API_KEY, if set, is sent to base_url
+    #     default_model: llama3.2:3b            # must exist on the server
+    #     models: {premium: llama3.2:3b, full: llama3.2:3b, light: llama3.2:3b}
   tts:
     name: elevenlabs
     # openai example (word timestamps come from forced alignment):

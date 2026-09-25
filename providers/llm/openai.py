@@ -1,9 +1,10 @@
 """
 OpenAI (and OpenAI-compatible) LLM provider.
 
-Requires: pip install openai. Set OPENAI_API_KEY in .env.
+Requires: pip install openai. Set OPENAI_API_KEY in .env; a local server
+reached through base_url (e.g. Ollama) does not need a key.
 
-obsidian.yaml:
+obsidian.yaml for OpenAI:
     providers:
       llm:
         name: openai
@@ -13,8 +14,21 @@ obsidian.yaml:
             premium: gpt-4o
             full: gpt-4o
             light: gpt-4o-mini
-          # base_url: http://localhost:11434/v1   # any OpenAI-compatible server (e.g. Ollama)
           # api_key_env: OPENAI_API_KEY           # env var holding the key
+
+obsidian.yaml for Ollama or another OpenAI-compatible server:
+    providers:
+      llm:
+        name: openai
+        options:
+          base_url: http://localhost:11434/v1
+          # api_key_env: MY_SERVER_KEY   # remote server: its own key; otherwise
+          #                              # OPENAI_API_KEY, if set, is sent to base_url
+          default_model: llama3.2:3b     # must exist on the server
+          models:                        # a missing tier falls back to default_model
+            premium: llama3.2:3b
+            full: llama3.2:3b
+            light: llama3.2:3b
 """
 
 from __future__ import annotations

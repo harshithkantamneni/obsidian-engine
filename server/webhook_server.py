@@ -1854,37 +1854,113 @@ def api_optimizer_pause():
 
 # ── Setup Wizard API ─────────────────────────────────────────────────────────
 
+# "needed_by" lists the (provider type, built-in provider name) pairs that read
+# the key. A key is required only while one of those providers is configured in
+# obsidian.yaml (types left unset use the built-in defaults). Keys without
+# "needed_by" are always optional.
 _SETUP_API_KEYS = [
-    {"key": "ANTHROPIC_API_KEY", "label": "Anthropic (Claude)", "required": True,
-     "help": "https://console.anthropic.com", "category": "llm"},
-    {"key": "ELEVENLABS_API_KEY", "label": "ElevenLabs (TTS)", "required": True,
-     "help": "https://elevenlabs.io", "category": "tts"},
-    {"key": "FAL_KEY", "label": "fal.ai (Images)", "required": True,
-     "help": "https://fal.ai/dashboard/keys", "category": "images"},
-    {"key": "PEXELS_API_KEY", "label": "Pexels (Stock Footage)", "required": True,
-     "help": "https://www.pexels.com/api/new/", "category": "footage"},
-    {"key": "SUPABASE_URL", "label": "Supabase URL", "required": False,
+    {"key": "ANTHROPIC_API_KEY", "label": "Anthropic (Claude)",
+     "help": "https://console.anthropic.com", "category": "llm",
+     "needed_by": (("llm", "anthropic"),)},
+    {"key": "OPENAI_API_KEY", "label": "OpenAI (GPT, TTS)",
+     "help": "https://platform.openai.com/api-keys", "category": "llm",
+     "needed_by": (("llm", "openai"), ("tts", "openai"))},
+    {"key": "ELEVENLABS_API_KEY", "label": "ElevenLabs (TTS)",
+     "help": "https://elevenlabs.io", "category": "tts",
+     "needed_by": (("tts", "elevenlabs"),)},
+    {"key": "FAL_KEY", "label": "fal.ai (Images)",
+     "help": "https://fal.ai/dashboard/keys", "category": "images",
+     "needed_by": (("images", "fal"),)},
+    {"key": "PEXELS_API_KEY", "label": "Pexels (Stock Footage)",
+     "help": "https://www.pexels.com/api/new/", "category": "footage",
+     "needed_by": (("footage", "pexels"),)},
+    {"key": "SUPABASE_URL", "label": "Supabase URL",
      "help": "https://supabase.com", "category": "database"},
-    {"key": "SUPABASE_KEY", "label": "Supabase Key", "required": False,
+    {"key": "SUPABASE_KEY", "label": "Supabase Key",
      "help": "https://supabase.com", "category": "database"},
-    {"key": "TELEGRAM_BOT_TOKEN", "label": "Telegram Bot Token", "required": False,
+    {"key": "TELEGRAM_BOT_TOKEN", "label": "Telegram Bot Token",
      "help": "https://t.me/BotFather", "category": "notifications"},
-    {"key": "TELEGRAM_CHAT_ID", "label": "Telegram Chat ID", "required": False,
+    {"key": "TELEGRAM_CHAT_ID", "label": "Telegram Chat ID",
      "help": "https://t.me/userinfobot", "category": "notifications"},
-    {"key": "EPIDEMIC_SOUND_API_KEY", "label": "Epidemic Sound", "required": False,
-     "help": "https://www.epidemicsound.com/account/api-keys", "category": "music"},
+    {"key": "EPIDEMIC_SOUND_API_KEY", "label": "Epidemic Sound",
+     "help": "https://www.epidemicsound.com/account/api-keys", "category": "music",
+     "needed_by": (("tts", "epidemic_sound"), ("music", "epidemic_sound"),
+                   ("sfx", "epidemic_sound"))},
 ]
+
+
+def _setup_providers_section() -> dict:
+    """The providers: block of obsidian.yaml, read from disk on every call.
+
+    core.config.cfg is loaded once at import, so it does not see providers
+    written by /api/setup/save until the server restarts. Honors
+    OBSIDIAN_CONFIG like core.config, so this matches what the pipeline reads.
+    """
+    path = Path(os.environ["OBSIDIAN_CONFIG"]) if os.getenv("OBSIDIAN_CONFIG") else CONFIG_YAML_PATH
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        return {}
+    section = data.get("providers") if isinstance(data, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _setup_active_providers(section: dict) -> dict:
+    """{type: (name, options)}. Types missing from the file use the built-in defaults.
+
+    Mirrors providers.registry._resolve_provider_config: options only apply
+    when the section names a provider.
+    """
+    from providers.registry import _DEFAULTS
+    active = {}
+    for ptype, default in _DEFAULTS.items():
+        entry = section.get(ptype)
+        entry = entry if isinstance(entry, dict) else {}
+        explicit = entry.get("name") or entry.get("provider")
+        options = entry.get("options") if explicit else None
+        active[ptype] = (str(explicit or default), options if isinstance(options, dict) else {})
+    return active
+
+
+def _setup_key_required(entry: dict, active: dict) -> bool:
+    """True when a configured built-in provider reads this key.
+
+    Custom (dotted) providers and music/sfx "auto" never make a key required.
+    """
+    key = entry["key"]
+    for ptype, pname in entry.get("needed_by", ()):
+        name, options = active.get(ptype, ("", {}))
+        if name != pname:
+            continue
+        if options.get("api_key_env", key) != key:
+            continue  # the provider reads a different env var
+        if (ptype, pname) == ("llm", "openai") and options.get("base_url") \
+                and "api_key_env" not in options:
+            continue  # local OpenAI-compatible server (e.g. Ollama): the key is optional
+        return True
+    return False
 
 
 @app.route("/api/setup/status")
 @require_key_or_first_run
 def api_setup_status():
-    """Return setup status: which keys are configured, current profile, providers."""
+    """Return setup status: which keys are configured, current profile, providers.
+
+    "required" is true only for keys that a configured provider needs, so
+    setup_complete follows the providers in obsidian.yaml.
+    """
+    providers_section = _setup_providers_section()
+    active = _setup_active_providers(providers_section)
     keys_status = []
     for entry in _SETUP_API_KEYS:
         val = os.getenv(entry["key"], "")
         keys_status.append({
-            **entry,
+            "key": entry["key"],
+            "label": entry["label"],
+            "required": _setup_key_required(entry, active),
+            "help": entry["help"],
+            "category": entry["category"],
             "configured": bool(val and val.strip()),
         })
 
@@ -1916,18 +1992,12 @@ def api_setup_status():
                 pass
             available_profiles.append({"name": name, "description": desc})
 
-    # Current providers
+    # Current providers (as written in obsidian.yaml; unset types are omitted)
     providers = {}
-    try:
-        from core.config import cfg
-        psec = cfg.get("providers")
-        if psec:
-            for ptype in ["llm", "tts", "images", "footage", "upload"]:
-                section = psec.get(ptype)
-                if section:
-                    providers[ptype] = section.get("name") or section.get("provider", "")
-    except Exception:
-        pass
+    for ptype in ["llm", "tts", "images", "footage", "upload"]:
+        section = providers_section.get(ptype)
+        if isinstance(section, dict) and section:
+            providers[ptype] = section.get("name") or section.get("provider", "")
 
     # Available providers
     try:
@@ -1936,7 +2006,7 @@ def api_setup_status():
     except Exception:
         available_providers = {}
 
-    # Check if setup is complete (all required keys present)
+    # Setup is complete when every key a configured provider needs is set
     required_configured = all(
         k["configured"] for k in keys_status if k["required"]
     )
@@ -1974,6 +2044,15 @@ def api_setup_validate():
                     "x-api-key": key_value,
                     "anthropic-version": "2023-06-01",
                 },
+                timeout=10,
+            )
+            result["valid"] = r.status_code == 200
+
+        elif key_name == "OPENAI_API_KEY":
+            import requests
+            r = requests.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {key_value}"},
                 timeout=10,
             )
             result["valid"] = r.status_code == 200

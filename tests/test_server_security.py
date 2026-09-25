@@ -387,3 +387,145 @@ class TestRebindingAndCrossSite:
                         headers={"X-Trigger-Key": KEY, "Origin": "http://localhost"},
                         environ_base=LOCAL)
         assert r.status_code == 200, r.get_json()
+
+
+# ── Setup status: keys are required only for configured providers ────────────
+
+_WIZARD_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY",
+                "FAL_KEY", "PEXELS_API_KEY", "EPIDEMIC_SOUND_API_KEY")
+_OLLAMA_YAML = ("providers:\n  llm:\n    name: openai\n    options:\n"
+                "      base_url: http://localhost:11434/v1\n")
+
+
+class TestSetupRequiredKeys:
+    def _status(self, client, yaml_path, monkeypatch, providers_yaml, env=None):
+        yaml_path.write_text(providers_yaml)
+        monkeypatch.delenv("OBSIDIAN_CONFIG", raising=False)
+        for k in _WIZARD_KEYS:
+            monkeypatch.delenv(k, raising=False)
+        for k, v in (env or {}).items():
+            monkeypatch.setenv(k, v)
+        r = client.get("/api/setup/status", environ_base=LOCAL)
+        assert r.status_code == 200, r.get_json()
+        data = r.get_json()
+        return data, {k["key"]: k for k in data["keys"]}
+
+    @pytest.mark.parametrize("providers_yaml, required", [
+        # nothing configured: the built-in defaults apply
+        ("profile: documentary\n",
+         {"ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        (SAMPLE_YAML,
+         {"ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        ("providers:\n  llm:\n    name: openai\n",
+         {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        (_OLLAMA_YAML,
+         {"ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        ("providers:\n  llm:\n    name: my_pkg.llm.MyLLM\n  tts:\n    name: openai\n",
+         {"OPENAI_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        ("providers:\n  tts:\n    name: openai\n    options: {api_key_env: MY_TTS_KEY}\n",
+         {"ANTHROPIC_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        ("providers:\n  tts:\n    name: epidemic_sound\n  music:\n    name: auto\n",
+         {"ANTHROPIC_API_KEY", "EPIDEMIC_SOUND_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        ("providers:\n  llm:\n    provider: openai\n",
+         {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        # base_url plus an explicit key env: a hosted OpenAI-compatible server
+        ("providers:\n  llm:\n    name: openai\n    options:\n"
+         "      base_url: https://example.test/v1\n      api_key_env: OPENAI_API_KEY\n",
+         {"OPENAI_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        # the base_url exemption is for the openai LLM only
+        ("providers:\n  tts:\n    name: openai\n    options: {base_url: http://x/v1}\n",
+         {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+        # options without a provider name are ignored, as in the registry
+        ("providers:\n  tts:\n    options: {api_key_env: MY_EL}\n",
+         {"ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY", "FAL_KEY", "PEXELS_API_KEY"}),
+    ], ids=["no-providers", "sample", "openai", "ollama", "custom-llm-openai-tts",
+            "tts-api_key_env", "epidemic-tts", "provider-alias", "base_url-with-key-env",
+            "tts-base_url", "options-without-name"])
+    def test_required_follows_configured_providers(self, client, no_key, setup_files,
+                                                   monkeypatch, providers_yaml, required):
+        _, yaml_path = setup_files
+        data, keys = self._status(client, yaml_path, monkeypatch, providers_yaml)
+        assert {k for k, v in keys.items() if v["required"]} == required
+        assert data["setup_complete"] is False
+
+    def test_complete_without_anthropic_key_when_llm_is_not_anthropic(
+            self, client, no_key, setup_files, monkeypatch):
+        _, yaml_path = setup_files
+        data, keys = self._status(client, yaml_path, monkeypatch, _OLLAMA_YAML, env={
+            "ELEVENLABS_API_KEY": "el", "FAL_KEY": "fal_x", "PEXELS_API_KEY": "px"})
+        assert keys["ANTHROPIC_API_KEY"]["configured"] is False
+        assert data["setup_complete"] is True
+
+    def test_default_llm_still_needs_anthropic_key(self, client, no_key, setup_files, monkeypatch):
+        _, yaml_path = setup_files
+        env = {"ELEVENLABS_API_KEY": "el", "FAL_KEY": "fal_x", "PEXELS_API_KEY": "px"}
+        data, _ = self._status(client, yaml_path, monkeypatch, SAMPLE_YAML, env=env)
+        assert data["setup_complete"] is False
+        env["ANTHROPIC_API_KEY"] = "sk-ant"
+        data, _ = self._status(client, yaml_path, monkeypatch, SAMPLE_YAML, env=env)
+        assert data["setup_complete"] is True
+
+    def test_key_entries_keep_their_shape(self, client, no_key, setup_files, monkeypatch):
+        _, yaml_path = setup_files
+        data, _ = self._status(client, yaml_path, monkeypatch, SAMPLE_YAML)
+        assert {"keys", "profile", "available_profiles", "providers",
+                "available_providers", "setup_complete",
+                "trigger_key_configured"} <= set(data)
+        for k in data["keys"]:
+            assert set(k) == {"key", "label", "required", "help", "category", "configured"}
+            assert isinstance(k["required"], bool)
+
+    def test_obsidian_config_env_is_honored(self, client, no_key, setup_files,
+                                            monkeypatch, tmp_path):
+        _, yaml_path = setup_files
+        alt = tmp_path / "alt.yaml"
+        alt.write_text(_OLLAMA_YAML)
+        data, keys = self._status(client, yaml_path, monkeypatch, SAMPLE_YAML)
+        assert keys["ANTHROPIC_API_KEY"]["required"] is True
+        monkeypatch.setenv("OBSIDIAN_CONFIG", str(alt))
+        data = client.get("/api/setup/status", environ_base=LOCAL).get_json()
+        keys = {k["key"]: k for k in data["keys"]}
+        assert data["providers"]["llm"] == "openai"
+        assert keys["ANTHROPIC_API_KEY"]["required"] is False
+
+    def test_status_follows_saved_providers_without_restart(
+            self, client, with_key, setup_files, monkeypatch):
+        monkeypatch.delenv("OBSIDIAN_CONFIG", raising=False)
+        for k in _WIZARD_KEYS:
+            monkeypatch.delenv(k, raising=False)
+        hdr = {"X-Trigger-Key": KEY}
+        before = client.get("/api/setup/status", headers=hdr, environ_base=LOCAL).get_json()
+        assert before["providers"]["llm"] == "anthropic"
+        r = client.post("/api/setup/save", json={"providers": {"llm": "openai"}},
+                        headers=hdr, environ_base=LOCAL)
+        assert r.status_code == 200, r.get_json()
+        after = client.get("/api/setup/status", headers=hdr, environ_base=LOCAL).get_json()
+        required = {k["key"] for k in after["keys"] if k["required"]}
+        assert after["providers"]["llm"] == "openai"
+        assert "OPENAI_API_KEY" in required
+        assert "ANTHROPIC_API_KEY" not in required
+
+    def test_saves_openai_key(self, client, with_key, setup_files):
+        env_path, _ = setup_files
+        r = client.post("/api/setup/save", json={"keys": {"OPENAI_API_KEY": "sk-test"}},
+                        headers={"X-Trigger-Key": KEY}, environ_base=REMOTE)
+        assert r.status_code == 200, r.get_json()
+        assert "OPENAI_API_KEY=sk-test\n" in env_path.read_text()
+
+    def test_validate_openai_key(self, client, no_key, monkeypatch):
+        import requests
+
+        seen = {}
+
+        class _Resp:
+            status_code = 200
+
+        def fake_get(url, headers=None, timeout=None, **kw):
+            seen["url"], seen["auth"] = url, (headers or {}).get("Authorization")
+            return _Resp()
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        r = client.post("/api/setup/validate",
+                        json={"key": "OPENAI_API_KEY", "value": "sk-x"}, environ_base=LOCAL)
+        assert r.get_json()["valid"] is True
+        assert seen == {"url": "https://api.openai.com/v1/models", "auth": "Bearer sk-x"}
