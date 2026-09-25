@@ -18,29 +18,47 @@ profile: documentary
 
 
 # ── Providers ────────────────────────────────────────────────────────────────
-# Swap any service by changing the provider name.
+# Every external service goes through a provider. Swap one by changing its name.
 # Built-in options:
 #   llm:     anthropic, openai
-#   tts:     elevenlabs
+#   tts:     elevenlabs, openai, epidemic_sound
 #   images:  fal
 #   footage: pexels
-#   upload:  local
-#   music:   epidemic_sound, local
-#   sfx:     epidemic_sound, local
-# Or use a custom class: "my_package.module.ClassName"
+#   upload:  local, youtube
+#   music:   epidemic_sound, local, auto (Epidemic if EPIDEMIC_SOUND_API_KEY is set, else local)
+#   sfx:     epidemic_sound, local, auto
+#
+# Bring your own: set name to the dotted path of a class that extends the base
+# class in providers/base.py; "options" are passed to its constructor:
+#   tts:
+#     name: my_providers.tts.MyTTS       # my_providers/tts.py in the project root
+#     options: {api_url: "http://localhost:8000", voice: narrator}
+# Guide: docs/PROVIDERS.md   Self-check: python -m providers
 providers:
   llm:
     name: anthropic
+    # openai example:
+    #   name: openai
+    #   options:
+    #     default_model: gpt-4o
+    #     models: {premium: gpt-4o, full: gpt-4o, light: gpt-4o-mini}
+    #     # base_url: http://localhost:11434/v1   # any OpenAI-compatible server
   tts:
     name: elevenlabs
+    # openai example (word timestamps come from forced alignment):
+    #   name: openai
+    #   options: {model: tts-1, voice: onyx, quote_voice: echo}
   images:
     name: fal
   footage:
     name: pexels
   upload:
-    name: local
+    name: local                          # saves to outputs/final/; use "youtube" to publish
     options:
       # output_dir: "./outputs/final"   # Uncomment to set custom output path
+    # To publish to YouTube (OAuth via client_secrets.json):
+    #   name: youtube
+    #   options: {privacy: public}      # public | unlisted | private
   music:
     name: auto                           # "epidemic_sound", "local", or "auto"
   sfx:

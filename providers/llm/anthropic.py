@@ -1,7 +1,10 @@
 """
 Anthropic Claude LLM provider — default implementation.
 
-Wraps the existing clients/claude_client.py for provider interface compatibility.
+The pipeline's call_claude() talks to Anthropic directly when this provider is
+configured; this class exposes the same behaviour through the LLMProvider
+interface (it calls the internal Anthropic functions, never call_claude(), so
+there is no recursion).
 """
 
 from __future__ import annotations
@@ -14,9 +17,12 @@ from providers.base import LLMProvider
 class AnthropicProvider(LLMProvider):
     """Claude LLM provider using the Anthropic API."""
 
-    def __init__(self):
-        from clients.claude_client import SONNET
+    def __init__(self, models: dict | None = None):
+        from clients.claude_client import HAIKU, OPUS, SONNET
         self._default_model = SONNET
+        self.models = {"premium": OPUS, "full": SONNET, "light": HAIKU}
+        if models:
+            self.models.update(models)
 
     def generate(
         self,
@@ -27,11 +33,11 @@ class AnthropicProvider(LLMProvider):
         expect_json: bool = True,
         output_schema: dict | None = None,
     ) -> Any:
-        from clients.claude_client import call_claude
-        return call_claude(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=model or self._default_model,
+        from clients.claude_client import _anthropic_call
+        return _anthropic_call(
+            system_prompt,
+            user_prompt,
+            model or self._default_model,
             max_tokens=max_tokens,
             expect_json=expect_json,
             output_schema=output_schema,
@@ -45,11 +51,11 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 4000,
         output_schema: dict | None = None,
     ) -> str:
-        from clients.claude_client import call_claude_with_search
-        return call_claude_with_search(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=model or self._default_model,
+        from clients.claude_client import _anthropic_call_with_search
+        return _anthropic_call_with_search(
+            system_prompt,
+            user_prompt,
+            model or self._default_model,
             max_tokens=max_tokens,
             output_schema=output_schema,
         )

@@ -69,13 +69,14 @@ class EpidemicTTSProvider(TTSProvider):
         # Poll for completion
         deadline = time.time() + 60
         status = result.get("status", "GENERATING")
+        status_data = result
         while time.time() < deadline and status == "GENERATING":
             time.sleep(3)
             status_data = client.get_voiceover_status(voiceover_id)
             status = status_data.get("status", "UNKNOWN")
 
         if status == "FAILED":
-            reason = result.get("failure_reason", "unknown")
+            reason = status_data.get("failure_reason", "unknown")
             raise RuntimeError(f"Voiceover generation failed: {reason}")
         if status != "DONE":
             raise RuntimeError(f"Voiceover generation timed out: {status}")

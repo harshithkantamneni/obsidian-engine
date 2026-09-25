@@ -141,10 +141,13 @@ class TestFalProvider:
     """Test fal.ai provider instantiation."""
 
     def test_requires_api_key(self):
+        """Constructing never raises (so `python -m providers` can list it);
+        generating without a key raises a clear error."""
         from providers.images.fal import FalProvider
         with patch.dict("os.environ", {}, clear=True):
+            p = FalProvider()
             with pytest.raises(RuntimeError, match="FAL_KEY"):
-                FalProvider()
+                p.generate("a castle")
 
     def test_instantiation_with_key(self):
         from providers.images.fal import FalProvider

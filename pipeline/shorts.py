@@ -3,7 +3,6 @@ import sys
 import json
 import re
 import time
-import base64
 import shutil
 import subprocess
 import hashlib
@@ -13,23 +12,23 @@ from datetime import datetime
 from core.paths import MEDIA_DIR, ASSETS_DIR, CHUNKS_DIR, REMOTION_SRC, REMOTION_PUBLIC, OUTPUT_DIR, BASE_DIR
 from core.log import get_logger
 from pipeline.helpers import clean_script
-from pipeline.images import _fal_subscribe_with_retry
 from pipeline.render import validate_video_ffprobe
 
 logger = get_logger(__name__)
 
 
 def run_short_audio(short_script_data):
-    import requests
     try:
         from mutagen.mp3 import MP3
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "mutagen"], check=True)
         from mutagen.mp3 import MP3
 
-    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-    from core.pipeline_config import NARRATOR_VOICE_ID, AUDIO_CHUNK_MAX_CHARS
-    VOICE_ID  = NARRATOR_VOICE_ID
+    # TTS goes through the configured provider (providers.tts in obsidian.yaml)
+    from providers.registry import get_provider
+    from pipeline.audio import synthesize_chunk
+    tts = get_provider("tts")
+    from core.pipeline_config import AUDIO_CHUNK_MAX_CHARS
     MAX_CHARS = AUDIO_CHUNK_MAX_CHARS
 
     # Voice presets — build from overrides (never mutate originals, Fix 144)
@@ -61,44 +60,6 @@ def run_short_audio(short_script_data):
         if current.strip() and len(current.strip()) > 2:
             chunks.append(current.strip())
         return chunks
-
-    def generate_chunk(text, voice_settings=None, speed=None):
-        if voice_settings is None:
-            voice_settings = VOICE_BODY
-        if speed is None:
-            speed = VOICE_SPEED
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/with-timestamps"
-        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-        payload = {
-            "text": text, "model_id": "eleven_v3",
-            "voice_settings": voice_settings,
-            "speed": speed,
-        }
-        last_err = None
-        for attempt in range(5):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=120)
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as ce:
-                wait = 30 * (attempt + 1)
-                logger.warning(f"  Connection/timeout error, waiting {wait}s...")
-                time.sleep(wait)
-                last_err = ce
-                continue
-            if r.status_code == 200:
-                return json.loads(r.text, strict=False)
-            elif r.status_code == 429:
-                wait = 60 * (attempt + 1)
-                logger.warning(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/5)...")
-                time.sleep(wait)
-                last_err = Exception("ElevenLabs rate limit (429)")
-            elif r.status_code in (500, 502, 503):
-                wait = 30 * (attempt + 1)
-                logger.warning(f"  Server error ({r.status_code}), waiting {wait}s (attempt {attempt+1}/5)...")
-                time.sleep(wait)
-                last_err = Exception(f"ElevenLabs server error ({r.status_code})")
-            else:
-                raise Exception(f"ElevenLabs {r.status_code}: {r.text[:200]}")
-        raise last_err or Exception("Failed after 5 attempts")
 
     SHORT_CHUNKS_DIR = CHUNKS_DIR / "short"
     SHORT_CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,35 +94,8 @@ def run_short_audio(short_script_data):
             vs  = VOICE_HOOK if i == 0 else VOICE_BODY
             spd = HOOK_SPEED if i == 0 else VOICE_SPEED  # hook slightly faster for punch
             logger.info(f"[Short Audio] Chunk {i+1}/{len(chunks)}: generating ({len(chunk)} chars)...")
-            data = generate_chunk(chunk, voice_settings=vs, speed=spd)
-            audio_bytes = base64.b64decode(data.get("audio_base64", ""))
-            chunk_path.write_bytes(audio_bytes)
-
-            alignment = data.get("alignment") or {}
-            if not isinstance(alignment, dict):
-                alignment = {}
-            chars  = alignment.get("characters", [])
-            starts = alignment.get("character_start_times_seconds", [])
-            ends   = alignment.get("character_end_times_seconds", [])
-
-            chunk_words = []
-            word, word_start, last_end = "", None, 0.0
-            for j, ch in enumerate(chars):
-                if ch in (" ", "\n"):
-                    if word and word_start is not None:
-                        end_idx = j - 1
-                        word_end = ends[end_idx] if 0 <= end_idx < len(ends) else word_start + max(0.15, len(word) * 0.08)
-                        chunk_words.append({"word": word, "start": round(word_start, 3),
-                            "end": round(word_end, 3)})
-                        word, word_start = "", None
-                else:
-                    if word_start is None and j < len(starts):
-                        word_start = starts[j]
-                    word += ch
-                    if j < len(ends):
-                        last_end = ends[j]
-            if word and word_start is not None:
-                chunk_words.append({"word": word, "start": round(word_start, 3), "end": round(last_end, 3)})
+            chunk_words = synthesize_chunk(tts, chunk, chunk_path, voice_settings=vs,
+                                           speed=spd, role="narrator")
 
             with open(chunk_ts, "w") as f:
                 json.dump(chunk_words, f)
@@ -260,18 +194,16 @@ def run_short_audio(short_script_data):
 
 # ── Short pipeline: Images (portrait 9:16) ─────────────────────────────────────
 def run_short_images(short_storyboard_data):
-    try:
-        import fal_client  # noqa: F401
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "fal-client"], check=True)
+    # Images go through the configured provider (providers.images in obsidian.yaml)
+    from providers.registry import get_provider, get_provider_name
+    from pipeline.images import _place_image
+    if get_provider_name("images") == "fal":
+        from providers.images.fal import FalProvider
+        if not FalProvider.has_credentials():
+            logger.warning("[Short Images] WARNING: FAL_API_KEY not set — skipping")
+            return short_storyboard_data
+    image_provider = get_provider("images")
 
-    from pipeline.helpers import download_file
-    FAL_KEY = os.getenv("FAL_API_KEY")
-    if not FAL_KEY:
-        logger.warning("[Short Images] WARNING: FAL_API_KEY not set — skipping")
-        return short_storyboard_data
-
-    os.environ["FAL_KEY"] = FAL_KEY
     scenes = short_storyboard_data.get("scenes", [])
 
     IMAGE_MODEL = os.getenv("IMAGE_MODEL", "flux").lower()
@@ -311,30 +243,14 @@ def run_short_images(short_storyboard_data):
 
         logger.info(f"[Short Images] Scene {i+1}/{len(scenes)} ({mood}): generating...")
         try:
-            if IMAGE_MODEL == "recraft":
-                result = _fal_subscribe_with_retry("fal-ai/recraft/v3/text-to-image", {
-                    "prompt":      prompt,
-                    "image_size": {"width": 1440, "height": 2560},
-                    "num_images": 1,
-                    "style": "digital_illustration",
-                }, label=f"Short scene {i+1}")
-            else:
-                result = _fal_subscribe_with_retry("fal-ai/flux-pro/v1.1-ultra", {
-                    "prompt":      prompt,
-                    "image_size": {"width": 1440, "height": 2560},
-                    "num_images": 1,
-                    "safety_tolerance": "2",
-                }, label=f"Short scene {i+1}")
-            images = result.get("images", [])
-            if not images:
-                raise ValueError("fal.ai returned empty images list")
-            url = images[0]["url"]
-            download_file(url, img_path)
+            # Portrait 9:16 (fal: Recraft 1440x2560, or Flux Ultra aspect_ratio 9:16)
+            out = image_provider.generate(prompt, style=IMAGE_MODEL, width=1440, height=2560)
+            _place_image(out, img_path)
             logger.info(f"  ✓ {img_path.name} ({img_path.stat().st_size // 1024}KB)")
             scene["ai_image"] = str(img_path)
             time.sleep(0.5)
         except Exception as e:
-            logger.error(f"  ✗ fal.ai failed for short image: {e}")
+            logger.error(f"  ✗ {image_provider.name} failed for short image: {e}")
             # Fallback: try to reuse a long-form AI image if available
             fallback_long = ASSETS_DIR / f"scene_{i:03d}_ai.jpg"
             if fallback_long.exists():

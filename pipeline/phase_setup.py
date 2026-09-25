@@ -285,8 +285,21 @@ def load_agents(ctx: PipelineContext) -> None:
 
 
 def run_credit_checks(ctx: PipelineContext) -> None:
-    """Anthropic + ElevenLabs credit gates. Replaces lines 267-314."""
-    # Anthropic
+    """LLM (Anthropic only) + TTS provider credit gates."""
+    from providers.registry import get_provider_name
+
+    try:
+        _llm_name = get_provider_name("llm")
+    except Exception:
+        _llm_name = "anthropic"
+    if _llm_name == "anthropic":
+        _check_anthropic_credits()
+    else:
+        logger.info(f"[LLM] Provider '{_llm_name}' — skipping Anthropic credit check")
+    _check_tts_credits()
+
+
+def _check_anthropic_credits() -> None:
     try:
         import anthropic as _anth
         _test_client = _anth.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -310,33 +323,34 @@ def run_credit_checks(ctx: PipelineContext) -> None:
             )
         logger.warning(f"[Anthropic] Credit check warning: {e}")
 
-    # ElevenLabs
-    elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
-    if elevenlabs_key:
-        try:
-            import requests as _req
-            r = _req.get(
-                "https://api.elevenlabs.io/v1/user",
-                headers={"xi-api-key": elevenlabs_key},
-                timeout=10,
+
+def _check_tts_credits() -> None:
+    """Ask the configured TTS provider for its quota (generic check_credits()).
+
+    Providers raise on an invalid key (e.g. ElevenLabs 401) — that aborts the
+    run early. Anything else is a warning. limit <= 0 means "unknown / no
+    quota endpoint" and is not logged.
+    """
+    label = "TTS"
+    try:
+        from providers.registry import get_provider
+        tts = get_provider("tts")
+        label = getattr(tts, "name", "TTS")
+        credits = tts.check_credits() or {}
+        limit = credits.get("limit", 0) or 0
+        remaining = credits.get("remaining", 0) or 0
+        if limit > 0:
+            unit = credits.get("unit", "characters")
+            unit = "chars" if unit == "characters" else unit
+            used_pct = ((limit - remaining) / limit) * 100
+            logger.info(
+                f"[{label}] Credits: {remaining:,} {unit} remaining ({used_pct:.0f}% used)"
+                + (" — overage active" if remaining < 0 else "")
             )
-            if r.status_code == 200:
-                sub = json.loads(r.text, strict=False).get("subscription", {})
-                limit = sub.get("character_limit", 1)
-                used = sub.get("character_count", 0)
-                remaining = limit - used
-                used_pct = (used / limit) * 100 if limit > 0 else 0
-                overage = remaining < 0
-                logger.info(
-                    f"[ElevenLabs] Credits: {remaining:,} chars remaining ({used_pct:.0f}% used)"
-                    + (" — overage active" if overage else "")
-                )
-            elif r.status_code == 401:
-                raise Exception("ElevenLabs API key invalid or quota exceeded (401)")
-        except Exception as e:
-            if "401" in str(e):
-                raise
-            logger.warning(f"[ElevenLabs] Credit check warning: {e}")
+    except Exception as e:
+        if "401" in str(e):
+            raise
+        logger.warning(f"[{label}] Credit check warning: {e}")
 
 
 def run_topic_dedup(ctx: PipelineContext) -> None:

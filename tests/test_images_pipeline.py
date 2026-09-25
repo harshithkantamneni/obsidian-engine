@@ -15,6 +15,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+@pytest.fixture(autouse=True)
+def _fal_provider_env(monkeypatch):
+    """Scene images go through the built-in fal ImageProvider (the default in
+    obsidian.yaml), which needs a key and is cached by the registry."""
+    from providers import registry
+    monkeypatch.setenv("FAL_KEY", "test-fal-key")
+    registry.clear_cache()
+    yield
+    registry.clear_cache()
+
+
 # ── _fal_subscribe_with_retry tests ───────────────────────────────────────
 
 
@@ -152,15 +163,15 @@ class TestFalSubscribeWithRetry:
 
 
 class TestScoreImage:
-    def test_score_returns_zero_on_missing_file(self, tmp_path):
-        """Non-existent file should return 0 (try/except catches it)."""
+    def test_score_returns_none_on_missing_file(self, tmp_path):
+        """Non-existent file → None ("no score"), not 0 (which forced regenerations)."""
         from pipeline.images import _score_image
         score = _score_image(str(tmp_path / "nonexistent.jpg"))
-        assert score == 0
+        assert score is None
 
     @patch("clients.claude_client.client")
-    def test_score_returns_zero_on_api_error(self, mock_client, tmp_path):
-        """API errors should return 0 gracefully."""
+    def test_score_returns_none_on_api_error(self, mock_client, tmp_path):
+        """API errors → None gracefully (image accepted, no regeneration loop)."""
         mock_client.messages.create.side_effect = Exception("API down")
 
         img = tmp_path / "test.jpg"
@@ -168,7 +179,18 @@ class TestScoreImage:
 
         from pipeline.images import _score_image
         score = _score_image(str(img))
-        assert score == 0
+        assert score is None
+
+    @patch("clients.claude_client.client")
+    def test_score_parses_number(self, mock_client, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        resp = MagicMock()
+        resp.content = [MagicMock(text="8")]
+        mock_client.messages.create.return_value = resp
+        img = tmp_path / "test.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0")
+        from pipeline.images import _score_image
+        assert _score_image(str(img)) == 8
 
     def test_score_regex_parsing(self):
         """Verify the regex correctly extracts scores from various response formats."""
@@ -194,7 +216,7 @@ class TestScoreImage:
 
 class TestGenerateSingleImage:
     @patch("pipeline.images._score_image", return_value=9)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_successful_generation(self, mock_retrieve, mock_fal, mock_score, tmp_path):
@@ -224,7 +246,7 @@ class TestGenerateSingleImage:
         assert updated["ai_image"] is not None
 
     @patch("pipeline.images._score_image", return_value=0)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_empty_images_list_raises(self, mock_retrieve, mock_fal, mock_score, tmp_path):
@@ -263,7 +285,7 @@ class TestGenerateSingleImage:
         assert updated["ai_image"] is None
 
     @patch("pipeline.images._score_image", return_value=5)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images.time.sleep")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
@@ -292,7 +314,7 @@ class TestGenerateSingleImage:
         assert success is True
 
     @patch("pipeline.images._score_image", return_value=9)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_hook_scene_higher_threshold(self, mock_retrieve, mock_fal, mock_score, tmp_path):
@@ -323,7 +345,7 @@ class TestGenerateSingleImage:
         assert mock_fal.call_count == 1
 
     @patch("pipeline.images._score_image", return_value=9)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_recraft_model_uses_correct_endpoint(self, mock_retrieve, mock_fal, mock_score, tmp_path):
@@ -349,7 +371,7 @@ class TestGenerateSingleImage:
         assert call_args[0][1]["style"] == "digital_illustration"
 
     @patch("pipeline.images._score_image", return_value=9)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_flux_model_uses_correct_endpoint(self, mock_retrieve, mock_fal, mock_score, tmp_path):
@@ -373,7 +395,7 @@ class TestGenerateSingleImage:
         call_args = mock_fal.call_args
         assert "flux-pro" in call_args[0][0]
 
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_wikimedia_fallback_no_url(self, mock_fal, tmp_path):
         """When fal.ai fails and no wikimedia URL, image is None."""
@@ -397,7 +419,7 @@ class TestGenerateSingleImage:
         assert updated["ai_image"] is None
 
     @patch("pipeline.images._score_image", return_value=9)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     @patch("pipeline.images._shutdown_event", MagicMock(is_set=MagicMock(return_value=False)))
     def test_breathing_room_lower_threshold(self, mock_retrieve, mock_fal, mock_score, tmp_path):
@@ -443,7 +465,7 @@ class TestGenerateCharacterPortraits:
         assert result == {}
 
     @patch("pipeline.images._score_image", return_value=9)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     def test_generates_top_characters(self, mock_retrieve, mock_fal, mock_score, tmp_path):
         mock_fal.return_value = {"images": [{"url": "http://portrait.jpg"}]}
@@ -473,7 +495,7 @@ class TestGenerateCharacterPortraits:
         assert len(portraits) == 2
 
     @patch("pipeline.images._score_image", return_value=3)
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     @patch("pipeline.helpers.download_file")
     def test_low_score_portrait_skipped(self, mock_retrieve, mock_fal, mock_score, tmp_path):
         """Portraits scoring below 7 should be skipped."""
@@ -495,7 +517,7 @@ class TestGenerateCharacterPortraits:
 
         assert "Caesar" not in portraits
 
-    @patch("pipeline.images._fal_subscribe_with_retry")
+    @patch("providers.images.fal._fal_subscribe_with_retry")
     def test_portrait_generation_failure_graceful(self, mock_fal, tmp_path):
         """If fal.ai fails for portraits, return empty dict gracefully."""
         mock_fal.side_effect = Exception("fal.ai error")

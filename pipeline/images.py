@@ -5,9 +5,6 @@ import json
 import time
 import shutil
 import os
-import sys
-import subprocess
-import random
 from pathlib import Path
 from datetime import datetime
 
@@ -171,34 +168,60 @@ def _apply_color_harmonization(scenes: list, palette: list[str]):
         logger.info(f"[Images] Color harmonization: {harmonized} images tinted toward palette")
 
 
-def _fal_subscribe_with_retry(model: str, arguments: dict, label: str = "fal.ai",
-                               max_attempts: int = 5, backoff_base: int = 2):
-    """Call fal_client.subscribe with exponential-backoff retries.
+# Back-compat re-export: the fal retry helper now lives in the fal provider.
+from providers.images.fal import _fal_subscribe_with_retry  # noqa: E402,F401
 
-    Retries on connection errors, timeouts, and rate limits (up to max_attempts).
+
+def _get_image_provider():
+    from providers.registry import get_provider
+    return get_provider("images")
+
+
+def _image_cost_service(provider) -> str:
+    """Cost-tracker service key for the active image provider."""
+    try:
+        from providers.registry import get_provider_name
+        name = get_provider_name("images")
+    except Exception:
+        name = getattr(provider, "name", "images")
+    return "fal_ai" if name == "fal" else name
+
+
+def _log_image_cost(provider) -> None:
+    try:
+        from core.cost_tracker import get_active_run_id, log_cost
+        _rid = get_active_run_id()
+        if _rid:
+            log_cost(_rid, "images", _image_cost_service(provider), 1, "images")
+    except Exception:
+        pass
+
+
+def _place_image(src, dest) -> None:
+    """Copy a provider's output image to dest (and drop provider temp files)."""
+    import tempfile
+    src = Path(src)
+    shutil.copyfile(src, dest)
+    try:
+        if Path(tempfile.gettempdir()).resolve() in src.resolve().parents:
+            src.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _score_image(image_path) -> int | None:
+    """Score image quality 1-10 using Claude Haiku vision.
+
+    Returns None when scoring is unavailable (LLM provider isn't the built-in
+    Anthropic one, no ANTHROPIC_API_KEY, or the call failed) — callers then
+    accept the image instead of regenerating it.
     """
-    import fal_client
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return fal_client.subscribe(model, arguments=arguments)
-        except Exception as e:
-            err_str = str(e).lower()
-            is_retryable = any(kw in err_str for kw in [
-                "timeout", "timed out", "connection", "rate limit", "429",
-                "502", "503", "504", "overloaded", "temporarily",
-            ])
-            if attempt == max_attempts or not is_retryable:
-                logger.error(f"  [{label}] Failed after {attempt} attempt(s): {e}")
-                raise
-            _rng = random.Random()
-            wait = (backoff_base ** attempt) + _rng.uniform(0, backoff_base ** attempt * 0.5)
-            logger.warning(f"  [{label}] Attempt {attempt}/{max_attempts} failed ({type(e).__name__}: {e}), retrying in {wait:.1f}s...")
-            time.sleep(wait)
-
-
-def _score_image(image_path) -> int:
-    """Score image quality 1-10 using Claude Haiku vision. Returns 0 on failure."""
+    try:
+        from clients.claude_client import anthropic_vision_available
+        if not anthropic_vision_available():
+            return None
+    except Exception:
+        return None
     try:
         from clients.claude_client import client as _vc, track_usage
         with open(image_path, "rb") as f:
@@ -215,9 +238,9 @@ def _score_image(image_path) -> int:
         except Exception:
             pass
         match = re.search(r'\d+', resp.content[0].text)
-        return int(match.group()) if match else 0
+        return int(match.group()) if match else None
     except Exception:
-        return 0
+        return None
 
 
 def _ensure_min_resolution(image_path, min_width: int = 1920, min_height: int = 1080) -> bool:
@@ -269,13 +292,13 @@ def _sharpen_for_video(image_path) -> bool:
 def _generate_single_image(idx, scene, total_scenes, assets_dir, image_model,
                            mood_light, style_recraft, style_flux,
                            character_portraits=None, visual_bible=None,
-                           era_constraints=None):
+                           era_constraints=None, image_provider=None):
     """Generate + quality-score one scene image. Thread-safe: unique file path per scene.
 
+    Images come from the configured ImageProvider (providers.images).
     Returns (idx, updated_scene, success).
     """
     import copy
-    from pipeline.helpers import download_file
     _thread = threading.current_thread().name
     scene = copy.deepcopy(scene)
     img_path = assets_dir / f"scene_{idx:03d}_ai.jpg"
@@ -382,8 +405,10 @@ def _generate_single_image(idx, scene, total_scenes, assets_dir, image_model,
 
         logger.info(f"  [{_thread}] Scene {idx+1}/{total_scenes} ({mood})...")
 
+        provider = image_provider or _get_image_provider()
         best_score = 0
         best_path = None
+        scoring_available = True
         for attempt in range(IMAGE_MAX_RETRIES):
             if _shutdown_event.is_set():
                 scene["ai_image"] = None
@@ -391,69 +416,44 @@ def _generate_single_image(idx, scene, total_scenes, assets_dir, image_model,
 
             attempt_path = assets_dir / f"scene_{idx:03d}_ai_attempt{attempt}.jpg" if attempt > 0 else img_path
 
-            # Check for character portrait → Kontext Pro routing
-            _used_kontext = False
+            # Character portrait → reference-image generation (e.g. fal Kontext Pro)
+            _used_reference = False
             characters = scene.get("characters_mentioned", [])
-            if character_portraits and characters:
+            if character_portraits and characters and getattr(provider, "supports_reference_images", False):
                 for c in characters:
                     if c in character_portraits:
                         portrait_path = character_portraits[c]
                         if Path(portrait_path).exists():
                             try:
-                                with open(portrait_path, "rb") as _pf:
-                                    ref_b64 = base64.b64encode(_pf.read()).decode()
                                 kontext_prompt = (
                                     f"Transform this into: {subject}, {era_context}{composition_hint}"
                                     f"{era_positive}{palette_hint}{mood_light.get(mood, 'deep shadows')}. "
                                     f"Keep the character's face, build, and clothing identical. {cur_style}{era_negative}"
                                 )
-                                result = _fal_subscribe_with_retry("fal-ai/flux-pro/kontext", {
-                                    "image_url": f"data:image/jpeg;base64,{ref_b64}",
-                                    "prompt": kontext_prompt,
-                                    "aspect_ratio": "16:9",
-                                    "num_images": 1,
-                                    "safety_tolerance": "2",
-                                }, label=f"{_thread} scene {idx+1} kontext")
-                                _used_kontext = True
+                                out = provider.generate_with_reference(
+                                    kontext_prompt, Path(portrait_path), width=1920, height=1080)
+                                _place_image(out, attempt_path)
+                                _used_reference = True
                             except Exception as kontext_err:
-                                logger.warning(f"  [{_thread}] Kontext Pro failed, falling back: {kontext_err}")
-                                _used_kontext = False
+                                logger.warning(f"  [{_thread}] Reference-image generation failed, falling back: {kontext_err}")
+                                _used_reference = False
                         break
 
-            if not _used_kontext:
-                if image_model == "recraft":
-                    result = _fal_subscribe_with_retry("fal-ai/recraft/v3/text-to-image", {
-                        "prompt": prompt,
-                        "image_size": {"width": 2560, "height": 1440},
-                        "num_images": 1,
-                        "style": "digital_illustration",
-                    }, label=f"{_thread} scene {idx+1}")
-                else:
-                    result = _fal_subscribe_with_retry("fal-ai/flux-pro/v1.1-ultra", {
-                        "prompt": prompt,
-                        "aspect_ratio": "16:9",
-                        "num_images": 1,
-                        "safety_tolerance": "2",
-                    }, label=f"{_thread} scene {idx+1}")
-
-            images = result.get("images", [])
-            if not images:
-                raise ValueError("fal.ai returned empty images list")
-            url = images[0]["url"]
-            download_file(url, attempt_path)
+            if not _used_reference:
+                out = provider.generate(prompt, style=image_model, width=1920, height=1080)
+                _place_image(out, attempt_path)
             logger.info(f"  [{_thread}] {attempt_path.name} ({attempt_path.stat().st_size//1024}KB)")
 
-            # Log fal.ai cost (per image generated, including retries)
-            try:
-                from core.cost_tracker import get_active_run_id, log_cost
-                _rid = get_active_run_id()
-                if _rid:
-                    log_cost(_rid, "images", "fal_ai", 1, "images")
-            except Exception:
-                pass
+            # Log image cost (per image generated, including retries)
+            _log_image_cost(provider)
 
-            # Quality gate via Claude Haiku vision
+            # Quality gate via Claude Haiku vision (None = scoring unavailable)
             _score = _score_image(attempt_path)
+            if _score is None:
+                scoring_available = False
+                best_path = attempt_path
+                logger.info(f"  [{_thread}] Quality scoring unavailable — accepting image")
+                break
 
             logger.info(f"  [{_thread}] Quality: {_score}/10 {'OK' if _score >= IMAGE_QUALITY_THRESHOLD else 'below threshold'}")
 
@@ -487,7 +487,7 @@ def _generate_single_image(idx, scene, total_scenes, assets_dir, image_model,
         for att in assets_dir.glob(f"scene_{idx:03d}_ai_attempt*.jpg"):
             att.unlink(missing_ok=True)
 
-        if best_score < IMAGE_QUALITY_THRESHOLD:
+        if scoring_available and best_score < IMAGE_QUALITY_THRESHOLD:
             logger.warning(f"  [{_thread}] Best quality {best_score}/10 — below {IMAGE_QUALITY_THRESHOLD} threshold but using anyway")
 
         # Safety net: upscale final image if still undersized after all retries
@@ -501,7 +501,7 @@ def _generate_single_image(idx, scene, total_scenes, assets_dir, image_model,
         return (idx, scene, True)
 
     except Exception as e:
-        logger.error(f"  [{_thread}] fal.ai failed for scene {idx+1}: {e}")
+        logger.error(f"  [{_thread}] Image generation failed for scene {idx+1}: {e}")
         # Wikimedia fallback
         visual = scene.get("visual", {})
         wiki_url = visual.get("url", "") if isinstance(visual, dict) else ""
@@ -535,12 +535,18 @@ def _generate_single_image(idx, scene, total_scenes, assets_dir, image_model,
         return (idx, scene, False)
 
 
-def _generate_character_portraits(visual_bible, scenes, assets_dir):
-    """Generate reference portraits for top characters using FLUX Pro Ultra. Returns {name: path}."""
-    from pipeline.helpers import download_file
+def _generate_character_portraits(visual_bible, scenes, assets_dir, image_provider=None):
+    """Generate reference portraits for top characters. Returns {name: path}.
+
+    Only used when the image provider supports reference images (the built-in
+    fal provider does, via Kontext Pro); otherwise portraits would be unused.
+    """
     char_descs = visual_bible.get("character_descriptions", {})
     art_style = visual_bible.get("art_style", "")
     if not char_descs:
+        return {}
+    provider = image_provider or _get_image_provider()
+    if not getattr(provider, "supports_reference_images", False):
         return {}
 
     # Count character appearances to prioritize
@@ -562,29 +568,16 @@ def _generate_character_portraits(visual_bible, scenes, assets_dir):
                 f"Portrait of {desc}, neutral studio background, "
                 f"front-facing 3/4 view, {art_style}, no text, no watermarks"
             )
-            result = _fal_subscribe_with_retry("fal-ai/flux-pro/v1.1-ultra", {
-                "prompt": portrait_prompt,
-                "aspect_ratio": "1:1",
-                "num_images": 1,
-            }, label=f"portrait_{slug}")
-
-            images = result.get("images", [])
-            if images:
-                download_file(images[0]["url"], portrait_path)
-                try:
-                    from core.cost_tracker import get_active_run_id, log_cost
-                    _rid = get_active_run_id()
-                    if _rid:
-                        log_cost(_rid, "images", "fal_ai", 1, "images")
-                except Exception:
-                    pass
-                score = _score_image(portrait_path)
-                if score >= 7:
-                    portraits[char_name] = str(portrait_path)
-                    logger.info(f"[Portraits] {char_name}: {score}/10")
-                else:
-                    logger.warning(f"[Portraits] {char_name} scored {score}/10 — skipping")
-                    portrait_path.unlink(missing_ok=True)
+            out = provider.generate(portrait_prompt, style="flux", width=1024, height=1024)
+            _place_image(out, portrait_path)
+            _log_image_cost(provider)
+            score = _score_image(portrait_path)
+            if score is None or score >= 7:
+                portraits[char_name] = str(portrait_path)
+                logger.info(f"[Portraits] {char_name}: {score if score is not None else 'unscored'}/10")
+            else:
+                logger.warning(f"[Portraits] {char_name} scored {score}/10 — skipping")
+                portrait_path.unlink(missing_ok=True)
         except Exception as e:
             logger.error(f"[Portraits] Failed for {char_name}: {e}")
 
@@ -592,18 +585,15 @@ def _generate_character_portraits(visual_bible, scenes, assets_dir):
 
 
 def run_images(manifest):
-    try:
-        import fal_client  # noqa: F401
-    except ImportError:
-        logger.info("[Images] Installing fal-client...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "fal-client"], check=True)
+    from providers.registry import get_provider_name
+    provider_name = get_provider_name("images")
+    if provider_name == "fal":
+        from providers.images.fal import FalProvider
+        if not FalProvider.has_credentials():
+            logger.warning("[Images] WARNING: FAL_API_KEY not set — skipping image generation")
+            return manifest
+    image_provider = _get_image_provider()
 
-    FAL_KEY = os.getenv("FAL_API_KEY")
-    if not FAL_KEY:
-        logger.warning("[Images] WARNING: FAL_API_KEY not set — skipping image generation")
-        return manifest
-
-    os.environ["FAL_KEY"] = FAL_KEY
     scenes = manifest.get("scenes", [])
 
     # Detect historical era for visual constraints
@@ -613,7 +603,7 @@ def run_images(manifest):
 
     # Generate character reference portraits if visual bible is available
     visual_bible = manifest.get("visual_bible", {})
-    character_portraits = _generate_character_portraits(visual_bible, scenes, ASSETS_DIR) if visual_bible else {}
+    character_portraits = _generate_character_portraits(visual_bible, scenes, ASSETS_DIR, image_provider) if visual_bible else {}
     if character_portraits:
         logger.info(f"[Images] Character portraits generated: {len(character_portraits)}")
 
@@ -640,7 +630,10 @@ def run_images(manifest):
         "absurdity":"bright incongruous lighting, slightly surreal color palette, vivid saturated tones that feel dreamlike and impossible",
     }
 
-    logger.info(f"[Images] Using model: {IMAGE_MODEL} ({'Recraft v3' if IMAGE_MODEL == 'recraft' else 'Flux Pro Ultra'})")
+    if provider_name == "fal":
+        logger.info(f"[Images] Using model: {IMAGE_MODEL} ({'Recraft v3' if IMAGE_MODEL == 'recraft' else 'Flux Pro Ultra'})")
+    else:
+        logger.info(f"[Images] Using image provider: {provider_name} ({image_provider.name})")
     generated = 0
 
     # Pre-filter cached scenes (synchronous)
@@ -664,7 +657,7 @@ def run_images(manifest):
                 fut = pool.submit(
                     _generate_single_image, idx, scene, len(scenes),
                     ASSETS_DIR, IMAGE_MODEL, MOOD_LIGHT, STYLE_RECRAFT, STYLE_FLUX,
-                    character_portraits, visual_bible, era_constraints,
+                    character_portraits, visual_bible, era_constraints, image_provider,
                 )
                 futures[fut] = idx
 
@@ -702,7 +695,7 @@ def run_images(manifest):
         raise Exception(
             f"[Images] ABORT: Only {scenes_with_images}/{total_scenes} scenes have images "
             f"({scenes_with_images/total_scenes*100:.0f}%). Pipeline would produce unwatchable video. "
-            f"Check fal.ai API key and quota, then retry with --from-stage 10"
+            f"Check {image_provider.name} API key and quota, then retry with --from-stage 10"
         )
 
     # Write image attribution audit log
@@ -719,7 +712,7 @@ def run_images(manifest):
         wiki_img = scene.get("wikimedia_url", "") or scene.get("footage_url", "")
 
         if ai_img and "ai.jpg" in str(ai_img):
-            entry["source"] = "fal.ai (AI generated)"
+            entry["source"] = f"{image_provider.name} (AI generated)"
             entry["license"] = "AI-generated, no copyright"
         elif wiki_img and "wikimedia" in str(wiki_img).lower():
             entry["source"] = "Wikimedia Commons"
