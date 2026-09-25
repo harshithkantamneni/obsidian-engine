@@ -72,3 +72,6 @@ state.json
 docs/*.pdf
 docs/*.tex
 CLAUDE.md
+
+# Runtime data mounted into Docker (may contain OAuth secrets)
+data/

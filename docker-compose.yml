@@ -1,8 +1,24 @@
 version: "3.8"
 
+# Quick start:
+#   cp .env.example .env        # fill in API keys + TRIGGER_KEY + DASHBOARD_PASSWORD
+#   mkdir -p data outputs remotion/public/music
+#   docker compose up -d --build
+#
+# Runtime state (channel_insights.json, lessons_learned.json) is kept in ./data.
+# For YouTube upload, put client_secrets.json and youtube_token.json in ./data/
+# (or set YOUTUBE_TOKEN_JSON in .env).
+#
+# The container runs as an unprivileged user (uid 1000 by default). On Linux,
+# if your host uid differs, build with: APP_UID=$(id -u) APP_GID=$(id -g) docker compose up -d --build
+
 services:
   obsidian:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     container_name: obsidian-archive
     ports:
       - "8080:8080"
@@ -10,16 +26,14 @@ services:
       - .env
     environment:
       - PORT=8080
+      - HOST=0.0.0.0       # required inside the container (app default is 127.0.0.1)
       - PYTHONUNBUFFERED=1
     volumes:
-      # Persist outputs, music, and credentials between restarts
+      # Persist outputs and music between restarts
       - ./outputs:/app/outputs
       - ./remotion/public/music:/app/remotion/public/music
-      - ./youtube_token.json:/app/youtube_token.json
-      - ./client_secrets.json:/app/client_secrets.json:ro
-      # Persist intelligence data (DNA scores, analytics, optimizer reports)
-      - ./channel_insights.json:/app/channel_insights.json
-      - ./lessons_learned.json:/app/lessons_learned.json
+      # Runtime JSON state + YouTube credentials (client_secrets.json, youtube_token.json)
+      - ./data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

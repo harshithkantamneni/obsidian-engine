@@ -1,9 +1,13 @@
 .git
+.gitignore
 .env
+.env.*
+!.env.example
 __pycache__
 *.pyc
 .claude/
 outputs/
+data/
 node_modules/
 remotion/public/music/*.mp3
 remotion/out/
@@ -12,5 +16,15 @@ remotion/out/
 tests/
 *.md
 .pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+# Secrets and runtime state — never bake into the image
 channel_insights.json
 lessons_learned.json
+client_secrets.json
+youtube_token.json
+*.json.bak
+*.json.tmp
