@@ -1,9 +1,11 @@
 """
 Thumbnail Agent — Generate and score high-quality YouTube thumbnails.
 
-Generates 3 distinct thumbnail concepts via Claude Sonnet, renders them with
-fal.ai Flux Pro, adds bold text overlay with Pillow, scores each with Claude
-Haiku vision, and returns the best one.
+Generates distinct thumbnail concepts via the LLM, renders them with the
+configured image provider (providers.images — fal.ai Flux Pro by default),
+adds bold text overlay with Pillow, scores each with Claude Haiku vision (when
+the LLM provider is Anthropic; otherwise variants get a neutral score), and
+returns the best one.
 """
 
 from __future__ import annotations
@@ -18,18 +20,6 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.agent_wrapper import call_agent
 from clients.claude_client import HAIKU
-
-# ── fal.ai setup ──────────────────────────────────────────────────────────────
-try:
-    import fal_client
-except ImportError:
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "fal-client"], check=True)
-    import fal_client
-
-_fal_key = os.getenv("FAL_API_KEY", "")
-if _fal_key:
-    os.environ["FAL_KEY"] = _fal_key
 
 # ── Pillow setup ──────────────────────────────────────────────────────────────
 try:
@@ -114,10 +104,10 @@ Requirements:
     return concepts[:5]
 
 
-# ── Step 2: Generate thumbnail images via fal.ai ────────────────────────────
+# ── Step 2: Generate thumbnail images via the image provider ─────────────────
 
 def _generate_image(prompt: str, index: int) -> str | None:
-    """Generate a single thumbnail image with fal.ai Flux Pro. Returns path or None."""
+    """Generate a single thumbnail image with the configured image provider. Returns path or None."""
 
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     img_path = THUMB_DIR / f"thumb_variant_{index:02d}.jpg"
@@ -132,15 +122,10 @@ def _generate_image(prompt: str, index: int) -> str | None:
     full_prompt = f"{prompt}, {thumb_style}"
 
     try:
-        result = fal_client.subscribe("fal-ai/flux-pro/v1.1-ultra", arguments={
-            "prompt": full_prompt,
-            "image_size": {"width": 1280, "height": 720},
-            "num_images": 1,
-            "safety_tolerance": "2",
-        })
-        url = result["images"][0]["url"]
-        from pipeline.helpers import download_file
-        download_file(url, img_path)
+        from providers.registry import get_provider
+        from pipeline.images import _place_image
+        out = get_provider("images").generate(full_prompt, style="flux", width=1280, height=720)
+        _place_image(out, img_path)
         print(f"  [Thumbnail] Variant {index + 1} generated ({img_path.stat().st_size // 1024}KB)")
         return str(img_path)
     except Exception as e:
@@ -275,6 +260,15 @@ def _add_text_overlay(image_path: str, text: str, color_scheme: str) -> str:
 def _score_thumbnail(image_path: str, concept: dict) -> dict:
     """Score a thumbnail on clickability, readability, and emotional impact."""
 
+    neutral = {"clickability": 5, "readability": 5, "emotional_impact": 5, "total": 15,
+               "brief_note": "scoring unavailable"}
+    try:
+        from clients.claude_client import anthropic_vision_available
+        if not anthropic_vision_available():
+            return neutral
+    except Exception:
+        return neutral
+
     with open(image_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode()
 
@@ -379,12 +373,14 @@ def run(seo_data: dict, script_data: dict, angle_data: dict) -> dict | None:
         return None
 
     # ── Step 2: Generate images ──────────────────────────────────────────────
-    fal_key = os.getenv("FAL_API_KEY", "")
-    if not fal_key:
-        print("[Thumbnail] WARNING: FAL_API_KEY not set — cannot generate images")
-        return None
+    from providers.registry import get_provider_name
+    if get_provider_name("images") == "fal":
+        from providers.images.fal import FalProvider
+        if not FalProvider.has_credentials():
+            print("[Thumbnail] WARNING: FAL_API_KEY not set — cannot generate images")
+            return None
 
-    print("[Thumbnail] Generating images with fal.ai Flux Pro...")
+    print(f"[Thumbnail] Generating images with image provider '{get_provider_name('images')}'...")
     variants = _generate_all_images(concepts)
 
     if not variants:
