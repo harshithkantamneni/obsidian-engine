@@ -2,12 +2,162 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from core.paths import MEDIA_DIR, REMOTION_SRC, REMOTION_PUBLIC
 from core.log import get_logger
+from pipeline.audio_assets import select_background_music, select_scene_ambient, select_scene_sfx
 
 logger = get_logger(__name__)
+
+# Synthetic reflection beat injected at the act3→ending boundary (seconds).
+REFLECTION_DURATION = 3.0
+# Narration encode settings — must match pipeline/audio.py mastering step.
+_NARRATION_SAMPLE_RATE = 44100
+_NARRATION_BITRATE = "192k"
+
+
+def _probe_audio(path) -> dict:
+    """Return {"duration", "sample_rate", "channels"} for an audio file via ffprobe."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate,channels:format=duration",
+         "-of", "json", str(path)],
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    info = json.loads(out.stdout or "{}")
+    stream = (info.get("streams") or [{}])[0]
+    return {
+        "duration": float((info.get("format") or {}).get("duration") or 0.0),
+        "sample_rate": int(stream.get("sample_rate") or _NARRATION_SAMPLE_RATE),
+        "channels": int(stream.get("channels") or 1),
+    }
+
+
+def splice_silence(src, dst, at_seconds: float, silence_seconds: float) -> bool:
+    """Write a copy of ``src`` to ``dst`` with ``silence_seconds`` of silence
+    inserted at ``at_seconds``. Never modifies ``src``.
+
+    Re-encodes to MP3 at the pipeline's narration settings (44.1kHz, 192k).
+    Returns True on success (output verified by duration), False otherwise —
+    on failure ``dst`` is left untouched.
+    """
+    src, dst = Path(src), Path(dst)
+    tmp = dst.with_name(dst.stem + ".splice_tmp" + dst.suffix)
+    try:
+        if not src.exists():
+            raise FileNotFoundError(f"source narration not found: {src}")
+        if src.resolve() == dst.resolve():
+            raise ValueError("splice_silence refuses to overwrite its source")
+        info = _probe_audio(src)
+        src_dur = info["duration"]
+        if not (0.0 < at_seconds < src_dur):
+            raise ValueError(f"splice point {at_seconds:.3f}s outside audio (0–{src_dur:.3f}s)")
+        ch = info["channels"]
+        layout = "mono" if ch == 1 else "stereo" if ch == 2 else f"{ch}c"
+        sr = info["sample_rate"]
+        fmt = f"aformat=sample_rates={sr}:channel_layouts={layout}"
+        t = f"{at_seconds:.6f}"
+        graph = (
+            f"[0:a]{fmt},asplit=2[pre_in][post_in];"
+            f"[pre_in]atrim=end={t},asetpts=PTS-STARTPTS[pre];"
+            f"[post_in]atrim=start={t},asetpts=PTS-STARTPTS[post];"
+            f"[1:a]{fmt},asetpts=PTS-STARTPTS[gap];"
+            f"[pre][gap][post]concat=n=3:v=0:a=1[out]"
+        )
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+             "-f", "lavfi", "-t", f"{silence_seconds:.6f}",
+             "-i", f"anullsrc=r={sr}:cl={layout}",
+             "-filter_complex", graph, "-map", "[out]",
+             "-c:a", "libmp3lame", "-ar", str(_NARRATION_SAMPLE_RATE),
+             "-b:a", _NARRATION_BITRATE, str(tmp)],
+            check=True, capture_output=True, timeout=600,
+        )
+        out_dur = _probe_audio(tmp)["duration"]
+        expected = src_dur + silence_seconds
+        if abs(out_dur - expected) > 0.25:
+            raise RuntimeError(f"spliced duration {out_dur:.3f}s != expected {expected:.3f}s")
+        os.replace(tmp, dst)
+        return True
+    except Exception as e:
+        logger.warning(f"[Convert] Narration silence splice failed: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _find_reflection_boundary(remotion_scenes):
+    """Index of the first 'ending' scene that directly follows an 'act3' scene, or None."""
+    for idx in range(len(remotion_scenes) - 1):
+        curr_pos = remotion_scenes[idx].get("narrative_position", "")
+        next_pos = remotion_scenes[idx + 1].get("narrative_position", "")
+        if curr_pos == "act3" and next_pos == "ending":
+            return idx + 1
+    return None
+
+
+def _inject_reflection_scene(remotion_scenes, words, total_duration, src_audio, dst_audio,
+                             splice_fn=None):
+    """Insert a synthetic reflection scene at the act3→ending boundary.
+
+    Scenes after the boundary and every word starting at/after the injection
+    time are shifted by REFLECTION_DURATION, and the SAME amount of silence is
+    spliced into the Remotion narration copy (``dst_audio``) at that same time.
+
+    The shift is only committed if the splice succeeds. Returns
+    ``(scenes, words, total_duration, spliced)``; when nothing is injected the
+    inputs are returned unchanged and ``spliced`` is False (caller must then
+    copy the narration verbatim).
+    """
+    splice_fn = splice_fn or splice_silence
+    inject_idx = _find_reflection_boundary(remotion_scenes)
+    if inject_idx is None:
+        return remotion_scenes, words, total_duration, False
+
+    dur = REFLECTION_DURATION
+    # Single source of truth for the boundary: scene shift, word shift and
+    # audio splice all use inject_t.
+    inject_t = remotion_scenes[inject_idx - 1].get("end_time", 0)
+    reflection_scene = {
+        "narration": "",
+        "start_time": inject_t,
+        "end_time": inject_t + dur,
+        "mood": "dark",
+        "visual_treatment": "standard",
+        "intent_music_volume_base": 1.15,
+        "intent_scene_energy": 0.1,
+        "narrative_position": "ending",
+        "narrative_function": "breathing_room",
+        "is_synthetic": True,
+        "is_breathing_room": True,
+        "words": [],
+        "ai_image": remotion_scenes[inject_idx - 1].get("ai_image", ""),
+        "image_url": "",
+    }
+    # Build shifted copies first — nothing is mutated until the splice succeeds.
+    new_scenes = list(remotion_scenes[:inject_idx]) + [reflection_scene] + [
+        {**s, "start_time": s.get("start_time", 0) + dur, "end_time": s.get("end_time", 0) + dur}
+        for s in remotion_scenes[inject_idx:]
+    ]
+    new_words = [
+        {**w, "start": w.get("start", 0) + dur, "end": w.get("end", 0) + dur}
+        if w.get("start", 0) >= inject_t else w
+        for w in words
+    ]
+
+    if not splice_fn(src_audio, dst_audio, inject_t, dur):
+        logger.warning("[Convert] Reflection scene NOT injected — narration splice failed "
+                       "(keeping audio/caption timing unshifted)")
+        return remotion_scenes, words, total_duration, False
+
+    logger.info(f"[Convert] ✓ Injected {dur}s reflection scene at act3→ending boundary "
+                f"(index {inject_idx}, t={inject_t:.3f}s; {dur}s silence spliced into narration)")
+    return new_scenes, new_words, total_duration + dur, True
 
 
 def align_scenes_to_words(n_scenes, words, total_duration, scene_word_ranges=None):
@@ -124,43 +274,16 @@ def run_convert(manifest, audio_data, topic="", era=""):
                 shutil.copy2(src, dest)
                 ai_image_name = src.name
 
-        # Ambient sound per scene mood — try Epidemic API first, fallback to local
-        ambient_file = None
-        if os.getenv("EPIDEMIC_SOUND_API_KEY"):
-            try:
-                from media.epidemic_sfx_manager import get_ambient_for_scene
-                ambient_file = get_ambient_for_scene(scene) or None
-            except Exception:
-                pass
-        if not ambient_file:
-            try:
-                from scripts.setup_ambience import get_ambient_file
-                ambient_file = get_ambient_file(
-                    scene.get("mood", "dark"),
-                    location=scene.get("location", ""),
-                    visual_desc=scene.get("visual_description", ""),
-                ) or None
-            except Exception:
-                pass
+        # Ambient sound per scene mood — via providers.sfx (built-ins: Epidemic API → local)
+        ambient_file = select_scene_ambient(scene, REMOTION_PUBLIC)
 
-        # SFX one-shot per scene (only on key moments) — try Epidemic API first
+        # SFX one-shot per scene (only on key moments) — via providers.sfx
         sfx_file = None
         sfx_start_offset = 0
         try:
             from scripts.setup_sfx import should_play_sfx
             if should_play_sfx(scene):
-                if os.getenv("EPIDEMIC_SOUND_API_KEY"):
-                    try:
-                        from media.epidemic_sfx_manager import get_sfx_for_scene
-                        sfx_file = get_sfx_for_scene(scene) or None
-                    except Exception:
-                        pass
-                if not sfx_file:
-                    try:
-                        from scripts.setup_sfx import get_sfx_file
-                        sfx_file = get_sfx_file(scene.get("mood", "dramatic")) or None
-                    except Exception:
-                        pass
+                sfx_file = select_scene_sfx(scene, REMOTION_PUBLIC)
                 # Align SFX to reveal word timestamp if available
                 if sfx_file and scene.get("is_reveal_moment") and words:
                     scene_words = [w for w in words
@@ -245,47 +368,8 @@ def run_convert(manifest, audio_data, topic="", era=""):
             split_scenes.append(scene)
     remotion_scenes = split_scenes
 
-    # Select background music — try smart selection first, fall back to random, then local files
-    music_file = None
-    music_start_offset = 0
-    try:
-        from media import music_manager
-        smart_result = music_manager.get_smart_music_for_video(remotion_scenes, total_duration)
-        if smart_result:
-            music_file = smart_result["music_file"]
-            music_start_offset = smart_result["music_start_offset"]
-            logger.info(f"[Convert] Smart music: {music_file} (offset={music_start_offset:.1f}s, "
-                  f"corr={smart_result['correlation_score']:.3f})")
-        else:
-            music_file = music_manager.get_music_for_video(remotion_scenes, total_duration)
-            if music_file:
-                logger.info(f"[Convert] Background music (random): {music_file}")
-    except Exception as _music_err:
-        logger.warning(f"[Convert] Music manager unavailable: {_music_err}")
-
-    # Fallback: local mood-mapped files
-    if not music_file:
-        mood_counts = {}
-        for s in remotion_scenes:
-            m = s.get("mood", "dark")
-            mood_counts[m] = mood_counts.get(m, 0) + 1
-        dominant_mood = max(mood_counts, key=mood_counts.get) if mood_counts else "dark"
-        MOOD_MUSIC = {
-            "dark":      "music/dark_01_scp_x1x.mp3",
-            "tense":     "music/tense_01_stay_the_course.mp3",
-            "dramatic":  "music/dramatic_01_strength_of_titans.mp3",
-            "cold":      "music/cold_01_scp_x5x.mp3",
-            "reverent":  "music/reverent_01_ancient_rite.mp3",
-            "wonder":    "music/wonder_01_the_descent.mp3",
-            "warmth":    "music/warmth_01_hearth_and_home.mp3",
-            "absurdity": "music/absurdity_01_scheming_weasel.mp3",
-        }
-        local_file = MOOD_MUSIC.get(dominant_mood, MOOD_MUSIC["dark"])
-        if (REMOTION_PUBLIC / local_file).exists():
-            music_file = local_file
-            logger.info(f"[Convert] Background music (local): {music_file} (mood: {dominant_mood})")
-        else:
-            logger.warning("[Convert] No background music available")
+    # Select background music — providers.music first, then local library fallbacks
+    music_file, music_start_offset = select_background_music(remotion_scenes, total_duration, REMOTION_PUBLIC)
 
     # Attempt track adaptation (exact duration + stems) if API available
     music_adapted = False
@@ -302,8 +386,15 @@ def run_convert(manifest, audio_data, topic="", era=""):
         if _music_track_id:
             try:
                 from media.track_adapter import adapt_to_duration
+                # The reflection beat (injected later) lengthens the video; fit the
+                # track to the final length so a non-looping adapted track doesn't
+                # end early. If injection is later skipped the track is merely
+                # trimmed by the render.
+                _music_target = total_duration + (
+                    REFLECTION_DURATION if _find_reflection_boundary(remotion_scenes) is not None else 0.0
+                )
                 adapted = adapt_to_duration(
-                    _music_track_id, total_duration,
+                    _music_track_id, _music_target,
                     scenes=remotion_scenes,
                     download_stems=True,
                 )
@@ -439,49 +530,25 @@ def run_convert(manifest, audio_data, topic="", era=""):
                 f"[Pacing] Scene {_i} ({_fn}) is {_dur:.1f}s — below 25s documentary target"
             )
 
-    # Inject synthetic reflection scene at act3→ending boundary
+    # Inject synthetic reflection scene at act3→ending boundary.
+    # The Remotion narration copy gets the same silence spliced in at the same
+    # timestamp; if the splice fails the injection is abandoned (no shift), so
+    # audio, captions and scene cuts can never drift apart.
+    narration_src = MEDIA_DIR / "narration.mp3"
+    narration_dst = REMOTION_PUBLIC / "narration.mp3"
+    narration_spliced = False
     try:
-        inject_idx = None
-        for idx in range(len(remotion_scenes) - 1):
-            curr_pos = remotion_scenes[idx].get("narrative_position", "")
-            next_pos = remotion_scenes[idx + 1].get("narrative_position", "")
-            if curr_pos == "act3" and next_pos == "ending":
-                inject_idx = idx + 1
-                break
-        if inject_idx is not None:
-            act3_end_time = remotion_scenes[inject_idx - 1].get("end_time", 0)
-            reflection_scene = {
-                "narration": "",
-                "start_time": act3_end_time,
-                "end_time": act3_end_time + 3.0,
-                "mood": "dark",
-                "visual_treatment": "standard",
-                "intent_music_volume_base": 1.15,
-                "intent_scene_energy": 0.1,
-                "narrative_position": "ending",
-                "narrative_function": "breathing_room",
-                "is_synthetic": True,
-                "is_breathing_room": True,
-                "words": [],
-                "ai_image": remotion_scenes[inject_idx - 1].get("ai_image", ""),
-                "image_url": "",
-            }
-            remotion_scenes.insert(inject_idx, reflection_scene)
-            # Shift subsequent scene start times by 3.0s
-            for s in remotion_scenes[inject_idx + 1:]:
-                s["start_time"] = s.get("start_time", 0) + 3.0
-                s["end_time"] = s.get("end_time", 0) + 3.0
-            total_duration += 3.0
+        (_new_scenes, _new_words, _new_total,
+         narration_spliced) = _inject_reflection_scene(
+            remotion_scenes, words, total_duration, narration_src, narration_dst)
+        if narration_spliced:
+            # Commit (plain assignments only — cannot partially fail)
+            remotion_scenes = _new_scenes
+            words[:] = _new_words  # in place: video_data["word_timestamps"] is this list
+            total_duration = _new_total  # +REFLECTION_DURATION, applied exactly once
             video_data["total_duration_seconds"] = total_duration
-            # Shift word timestamps that fall at or after the injection boundary
-            # so captions stay in sync with their shifted scenes
-            reflection_dur = 3.0
-            for w in words:
-                if w.get("start", 0) >= act3_end_time:
-                    w["start"] = w.get("start", 0) + reflection_dur
-                    w["end"] = w.get("end", 0) + reflection_dur
-            logger.info(f"[Convert] ✓ Injected {reflection_dur}s reflection scene at act3→ending boundary (index {inject_idx})")
     except Exception as _refl_err:
+        narration_spliced = False
         logger.warning(f"[Convert] Reflection scene injection skipped: {_refl_err}")
 
     # Compute film grain and vignette intensity per scene
@@ -583,8 +650,11 @@ def run_convert(manifest, audio_data, topic="", era=""):
     with open(vd_path, "w") as f:
         json.dump(video_data, f, indent=2)
 
-    # Copy audio
-    shutil.copy2(MEDIA_DIR / "narration.mp3", REMOTION_PUBLIC / "narration.mp3")
+    # Copy audio (unless the reflection splice already wrote the Remotion copy).
+    # The source narration in MEDIA_DIR is never modified, so re-running
+    # convert always rebuilds the Remotion copy from the pristine source.
+    if not narration_spliced:
+        shutil.copy2(narration_src, narration_dst)
 
     scenes_with_images = sum(1 for s in remotion_scenes if s.get("ai_image"))
     logger.info(f"[Convert] ✓ {len(remotion_scenes)} scenes, {len(words)} words, {scenes_with_images} images")

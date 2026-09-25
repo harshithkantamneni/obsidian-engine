@@ -1,10 +1,10 @@
 """
 Agent 09 - Footage Hunter v2
-Wikimedia-first for historical content. Pexels only for pure atmosphere.
+Wikimedia-first for historical content. Stock video (the configured footage
+provider — providers.footage, Pexels by default) only for pure atmosphere.
 """
 
 import sys
-import os
 import json
 import requests
 import time
@@ -13,8 +13,6 @@ _BASE = Path(__file__).resolve().parent.parent
 sys.path.append(str(_BASE))
 from dotenv import load_dotenv
 load_dotenv()
-
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
 _CACHE_FILE = _BASE / "outputs" / "footage_cache.json"
 _CACHE_TTL = 7 * 24 * 3600  # 7 days
@@ -178,43 +176,52 @@ def search_wikimedia(query, prefer_painting=True):
     _session_cache[cache_key] = None
     return None
 
-def search_pexels_video(query):
-    """Only used for pure atmospheric scenes."""
-    cache_key = f"pexels:{query}"
+def search_stock_video(query):
+    """Search the configured footage provider. Only used for pure atmospheric scenes.
+
+    Returns {"source", "url", "width", "height", "duration", "credit"} or None.
+    """
+    try:
+        from providers.registry import get_provider, get_provider_name
+        provider_name = get_provider_name("footage")
+        provider = get_provider("footage")
+    except Exception as e:
+        print(f"  [Footage] Provider unavailable: {e}")
+        return None
+
+    cache_key = f"{provider_name}:{query}"
     if cache_key in _session_cache:
         return _session_cache[cache_key]
     if cache_key in _footage_cache:
         cached = dict(_footage_cache[cache_key])
         cached.pop("_ts", None)
         return cached
-    url = "https://api.pexels.com/videos/search"
-    headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "per_page": 5, "orientation": "landscape"}
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        if r.status_code == 200:
-            videos = json.loads(r.text, strict=False).get("videos", [])
-            for video in videos:
-                files = video.get("video_files", [])
-                hd = [f for f in files if f.get("quality") == "hd" and f.get("width", 0) >= 1280]
-                if hd:
-                    result = {
-                        "source": "pexels",
-                        "url": hd[0]["link"],
-                        "width": hd[0].get("width", 1920),
-                        "height": hd[0].get("height", 1080),
-                        "duration": video.get("duration", 10),
-                        "credit": f"Video by {video.get('user', {}).get('name', 'Pexels')} on Pexels"
-                    }
-                    _footage_cache[cache_key] = {**result, "_ts": time.time()}
-                    _session_cache[cache_key] = result
-                    _save_cache(_footage_cache)
-                    return result
+        results = provider.search(query, orientation="landscape", min_duration=0, max_results=5)
+        for item in results or []:
+            if not item.get("url"):
+                continue
+            result = {
+                "source": provider_name,
+                "url": item["url"],
+                "width": item.get("width", 1920),
+                "height": item.get("height", 1080),
+                "duration": item.get("duration", 10),
+                "credit": item.get("credit") or f"Footage via {provider.name}",
+            }
+            _footage_cache[cache_key] = {**result, "_ts": time.time()}
+            _session_cache[cache_key] = result
+            _save_cache(_footage_cache)
+            return result
     except Exception as e:
-        print(f"  [Pexels] Error for '{query}': {e}")
+        print(f"  [{provider.name}] Error for '{query}': {e}")
     # Cache negative results in session to avoid re-querying within same run
     _session_cache[cache_key] = None
     return None
+
+
+# Backward-compatible alias (pre-provider name)
+search_pexels_video = search_stock_video
 
 # Scene type routing
 ATMOSPHERIC_QUERIES = {
@@ -252,9 +259,9 @@ def run(scenes_data):
                 visual = search_wikimedia(pexels_query, prefer_painting=False)
 
         elif visual_type in ["broll_atmospheric", "broll_nature"]:
-            # Atmospheric: try Pexels video first, Wikimedia as fallback
+            # Atmospheric: try stock video first, Wikimedia as fallback
             atm_query = ATMOSPHERIC_QUERIES.get(mood, pexels_query) or pexels_query
-            visual = search_pexels_video(atm_query)
+            visual = search_stock_video(atm_query)
             if not visual and wikimedia_query:
                 visual = search_wikimedia(wikimedia_query)
 
@@ -285,7 +292,7 @@ def run(scenes_data):
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    wikimedia_count = sum(1 for s in results if s.get("visual", {}).get("source") == "wikimedia")
-    pexels_count = sum(1 for s in results if s.get("visual", {}).get("source") == "pexels")
-    print(f"[Footage Hunter v2] Wikimedia: {wikimedia_count} | Pexels: {pexels_count}")
+    wikimedia_count = sum(1 for s in results if (s.get("visual") or {}).get("source") == "wikimedia")
+    stock_count = sum(1 for s in results if (s.get("visual") or {}).get("source") not in (None, "wikimedia"))
+    print(f"[Footage Hunter v2] Wikimedia: {wikimedia_count} | Stock video: {stock_count}")
     return manifest

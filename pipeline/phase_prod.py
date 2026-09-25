@@ -40,7 +40,7 @@ def run_production_phase(ctx: PipelineContext, runner: StageRunner) -> tuple:
     shorts_future, shorts_executor = _launch_shorts(ctx, runner)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Wave 1: SEO(6) + Scenes(7) + Compliance in parallel
+    # Wave 1: Compliance, then SEO(6) + Scenes(7) in parallel
     # ══════════════════════════════════════════════════════════════════════════
     _run_wave1(ctx, runner)
 
@@ -154,8 +154,11 @@ def _shorts_pipeline_impl(ctx: PipelineContext, runner: StageRunner):
                 if candidate.exists():
                     thumb = str(candidate)
                     break
+            from providers.registry import get_provider_name
+            if get_provider_name("upload") != "youtube":
+                return a11.upload_with_provider(video_path, _title, _description, _tags, thumb)
             return a11.upload_video(video_path, _title, _description, _tags,
-                                    thumbnail_path=thumb, privacy="public")
+                                    thumbnail_path=thumb, privacy=a11._youtube_privacy("public"))
 
         _short_upload_result = runner.run_short_stage("short_upload", "Short Upload", do_short_upload)
 
@@ -262,25 +265,13 @@ def _run_compliance(ctx: PipelineContext, runner: StageRunner):
         return None
 
 
-def _run_wave1(ctx: PipelineContext, runner: StageRunner) -> None:
-    """Wave 1 DAG: SEO(6) + Scenes(7) + Compliance in parallel."""
-    a06 = ctx.agents["a06"]
-    a07 = ctx.agents["a07"]
+def _apply_compliance(ctx: PipelineContext, runner: StageRunner, compliance_result) -> None:
+    """Apply compliance result to ctx.script, enforce the RED gate, persist.
 
-    logger.info("\n[Pipeline] \u2500\u2500 Parallel DAG Wave 1: SEO + Scenes + Compliance \u2500\u2500")
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dag_w1") as dag_pool:
-        seo_future = dag_pool.submit(runner.run_stage, 6, "SEO", a06.run, ctx.script, ctx.verification, ctx.angle)
-        scenes_future = dag_pool.submit(runner.run_stage, 7, "Scene Breakdown", a07.run, ctx.script, ctx.verification)
-        compliance_future = dag_pool.submit(_run_compliance, ctx, runner)
-
-        ctx.seo = seo_future.result()
-        ctx.scenes_data = scenes_future.result()
-        compliance_result = compliance_future.result()
-
-    # Apply compliance modifications to script (must happen before TTS)
-    if compliance_result and compliance_result.get("safe_script") and ctx.script:
-        ctx.script["full_script"] = compliance_result["safe_script"]
-
+    Must run BEFORE Scene Breakdown (stage 7): scene-aware audio narrates each
+    scene's ``narration`` field from stage 7, so the safe wording has to be in
+    ctx.script before stage 7 splits it into scenes.
+    """
     # Fatal gate: RED compliance with no auto-fix
     if compliance_result and compliance_result.get("risk") == "red":
         if not compliance_result.get("safe_script"):
@@ -288,6 +279,38 @@ def _run_wave1(ctx: PipelineContext, runner: StageRunner) -> None:
                 f"Compliance gate FAILED: {len(compliance_result.get('flags', []))} RED flags "
                 "could not be auto-fixed. Review flagged content before proceeding."
             )
+
+    # Apply compliance modifications to script (must happen before Scenes + TTS)
+    if compliance_result and compliance_result.get("safe_script") and ctx.script:
+        ctx.script["full_script"] = compliance_result["safe_script"]
+        # Persist the patched script back into stage_4 so a resume (which
+        # reloads ctx.script from state["stage_4"]) never sees the unpatched text.
+        runner.mark(4, ctx.script)
+        runner.mark_metadata("compliance", {
+            "risk_level": compliance_result.get("risk", "red"),
+            "flag_count": len(compliance_result.get("flags", [])),
+            "safe_script_applied": True,
+        })
+        logger.info("[Compliance] Patched script persisted to stage_4 before Scene Breakdown")
+
+
+def _run_wave1(ctx: PipelineContext, runner: StageRunner) -> None:
+    """Wave 1: Compliance first (patches script), then SEO(6) + Scenes(7) in parallel."""
+    a06 = ctx.agents["a06"]
+    a07 = ctx.agents["a07"]
+
+    # Compliance runs first (single LLM call) so SEO/Scenes see the safe script.
+    logger.info("\n[Pipeline] \u2500\u2500 Wave 1a: Compliance \u2500\u2500")
+    compliance_result = _run_compliance(ctx, runner)
+    _apply_compliance(ctx, runner, compliance_result)
+
+    logger.info("\n[Pipeline] \u2500\u2500 Parallel DAG Wave 1b: SEO + Scenes \u2500\u2500")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dag_w1") as dag_pool:
+        seo_future = dag_pool.submit(runner.run_stage, 6, "SEO", a06.run, ctx.script, ctx.verification, ctx.angle)
+        scenes_future = dag_pool.submit(runner.run_stage, 7, "Scene Breakdown", a07.run, ctx.script, ctx.verification)
+
+        ctx.seo = seo_future.result()
+        ctx.scenes_data = scenes_future.result()
 
     _check_and_warn(check_seo(ctx.seo or {}), "SEO")
     _check_and_warn(check_scenes(ctx.scenes_data or {}), "Scenes")
@@ -351,8 +374,14 @@ def _run_wave2(ctx: PipelineContext, runner: StageRunner) -> None:
             try:
                 formatted = a_tts_format.run(ctx.script)
                 if formatted and formatted.get("full_script"):
-                    # Display text uses full_script (original spellings for captions)
-                    ctx.display_script = {**ctx.script, "full_script": formatted["full_script"]}
+                    # Display text uses full_script with any phonetic respellings
+                    # reverted (original spellings for captions). Respellings are
+                    # single whitespace-free tokens, so word counts stay aligned
+                    # with the TTS text and audio.py's positional caption override
+                    # can map respelled words back to the original spelling.
+                    _display_text = _undo_respellings(
+                        formatted["full_script"], _pronunciation_map(a_tts_format))
+                    ctx.display_script = {**ctx.script, "full_script": _display_text}
                     # TTS text uses tts_script if available (phonetic respellings),
                     # falls back to full_script (no pronunciation changes)
                     tts_text = formatted.get("tts_script", formatted["full_script"])
@@ -371,6 +400,79 @@ def _run_wave2(ctx: PipelineContext, runner: StageRunner) -> None:
 # Wave 3: Audio + Footage + Thumbnail
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _pronunciation_map(a_tts_format) -> dict:
+    """Original term -> phonetic respelling, from the loaded TTS format agent.
+
+    Only whitespace-free respellings are kept so a respelling never changes
+    the word count (captions are aligned positionally).
+    """
+    pmap = getattr(a_tts_format, "PRONUNCIATION_MAP", None) if a_tts_format else None
+    if not isinstance(pmap, dict):
+        return {}
+    return {
+        k: v for k, v in pmap.items()
+        if isinstance(k, str) and isinstance(v, str) and k and v
+        and not any(c.isspace() for c in k + v)
+    }
+
+
+def _undo_respellings(text: str, pron_map: dict) -> str:
+    """Revert phonetic respellings in ``text`` back to the original terms."""
+    if not text or not pron_map:
+        return text
+    for term, respelling in sorted(pron_map.items(), key=lambda kv: -len(kv[1])):
+        text = text.replace(respelling, term)
+    return text
+
+
+def _respell_scenes_for_audio(scenes_data, tts_script, pron_map: dict):
+    """Return a copy of scenes_data whose ``narration`` carries the same
+    phonetic respellings the TTS format agent applied to the TTS script.
+
+    Scene-aware audio (>=3 narrated scenes) speaks scene["narration"], not the
+    TTS script, so without this the respellings only reached the legacy path.
+    Mirrors the agent: only terms it actually respelled, first occurrence only
+    (across all scenes in order), case-insensitive. The input is not mutated —
+    captions/display, footage and manifest keep the original spelling.
+    """
+    if not pron_map or not isinstance(scenes_data, dict) or not scenes_data.get("scenes"):
+        return scenes_data
+    tts_text = (tts_script or {}).get("full_script", "") if isinstance(tts_script, dict) else ""
+    active = {t: r for t, r in pron_map.items() if r in tts_text}
+    if not active:
+        return scenes_data
+
+    import re as _re
+    new_scenes = [dict(s) if isinstance(s, dict) else s for s in scenes_data["scenes"]]
+    applied = 0
+    for term, respelling in active.items():
+        pattern = _re.compile(_re.escape(term), _re.IGNORECASE)
+        for sc in new_scenes:
+            if not isinstance(sc, dict):
+                continue
+            narration = sc.get("narration") or ""
+            if pattern.search(narration):
+                sc["narration"] = pattern.sub(respelling, narration, count=1)
+                applied += 1
+                break  # first occurrence only
+    if not applied:
+        return scenes_data
+    logger.info(f"[TTS Format] {applied} pronunciation respelling(s) applied to scene narration (audio only)")
+    return {**scenes_data, "scenes": new_scenes}
+
+
+def _audio_scene_input(ctx: PipelineContext):
+    """Scenes passed to stage 8: respelled narration for TTS, originals elsewhere."""
+    try:
+        return _respell_scenes_for_audio(
+            ctx.scenes_data, ctx.tts_script,
+            _pronunciation_map(ctx.agents.get("a_tts_format")),
+        )
+    except Exception as e:
+        logger.warning(f"[TTS Format] Scene respelling skipped (non-fatal): {e}")
+        return ctx.scenes_data
+
+
 def _generate_thumbnail_task(ctx: PipelineContext):
     """Generate thumbnail (runs in thread pool or sequentially)."""
     from agents import thumbnail_agent
@@ -388,7 +490,7 @@ def _run_wave3(ctx: PipelineContext, runner: StageRunner) -> None:
     if _need_audio and _need_footage:
         logger.info("\n[Pipeline] Running Audio + Footage + Thumbnail in parallel...")
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dag_w3") as executor:
-            _audio_future = executor.submit(runner.run_stage, 8, "Audio Production", run_audio, ctx.tts_script, ctx.scenes_data, ctx.display_script)
+            _audio_future = executor.submit(runner.run_stage, 8, "Audio Production", run_audio, ctx.tts_script, _audio_scene_input(ctx), ctx.display_script)
             _footage_future = executor.submit(runner.run_stage, 9, "Footage Hunting", a09.run, ctx.scenes_data or {})
 
             _thumb_future = None
@@ -407,7 +509,7 @@ def _run_wave3(ctx: PipelineContext, runner: StageRunner) -> None:
                 except Exception as e:
                     logger.warning(f"[Pipeline] Thumbnail agent warning: {e}")
     else:
-        ctx.audio_data = runner.run_stage(8, "Audio Production", run_audio, ctx.tts_script, ctx.scenes_data, ctx.display_script)
+        ctx.audio_data = runner.run_stage(8, "Audio Production", run_audio, ctx.tts_script, _audio_scene_input(ctx), ctx.display_script)
         ctx.footage_data = runner.run_stage(9, "Footage Hunting", a09.run, ctx.scenes_data or {})
         if ctx.seo and not ctx.state.get("thumbnail"):
             try:

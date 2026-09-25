@@ -298,36 +298,51 @@ function MusicIntelTab({ data }: { data: Record<string, unknown> }) {
   const moodPerf = data.mood_performance as Record<string, { avg_views: number; avg_retention: number; video_count: number }> | undefined
   const bpmPerf = data.bpm_performance as Record<string, { avg_retention: number; count: number }> | undefined
   const recs = data.recommendations as string[] | undefined
-  const adapt = data.adaptation_impact as Record<string, number> | undefined
-  const stems = data.stems_impact as Record<string, number> | undefined
+  const adapt = data.adaptation_impact as {
+    adapted_avg_retention?: number; looped_avg_retention?: number
+    adapted_count?: number; looped_count?: number
+  } | undefined
+  const stems = data.stems_impact as {
+    stems_avg_retention?: number; no_stems_avg_retention?: number
+    stems_count?: number; no_stems_count?: number
+  } | undefined
   const sourceDist = data.source_distribution as Record<string, number> | undefined
 
   const moodEntries = moodPerf ? Object.entries(moodPerf).sort(([, a], [, b]) => b.avg_retention - a.avg_retention) : []
   const bpmEntries = bpmPerf ? Object.entries(bpmPerf).sort(([, a], [, b]) => b.avg_retention - a.avg_retention) : []
+  const bestMood = moodEntries[0]
+  const bestBpm = bpmEntries[0]
 
   return (
     <div class="space-y-4">
       {/* Summary cards */}
       <div class="grid grid-cols-3 gap-2">
-        {moodEntries.length > 0 && (
+        {bestMood && (
           <div class="p-3 rounded bg-bg-2 border border-success/30">
             <div class="text-xs text-dim">Best Mood</div>
-            <div class="text-bright capitalize">{moodEntries[0][0]}</div>
-            <div class="text-xs text-dim">{moodEntries[0][1].avg_retention}% retention</div>
+            <div class="text-bright capitalize">{bestMood[0]}</div>
+            <div class="text-xs text-dim">{bestMood[1].avg_retention}% retention</div>
           </div>
         )}
-        {adapt && adapt.adapted_count > 0 && (
+        {adapt && (adapt.adapted_count ?? 0) > 0 && (
           <div class="p-3 rounded bg-bg-2 border border-border">
             <div class="text-xs text-dim">Adapted vs Looped</div>
             <div class="text-bright">{((adapt.adapted_avg_retention || 0) - (adapt.looped_avg_retention || 0)).toFixed(1)}%</div>
             <div class="text-xs text-dim">retention lift</div>
           </div>
         )}
-        {bpmEntries.length > 0 && (
+        {bestBpm && (
           <div class="p-3 rounded bg-bg-2 border border-border">
             <div class="text-xs text-dim">Best BPM</div>
-            <div class="text-bright">{bpmEntries[0][0]}</div>
-            <div class="text-xs text-dim">{bpmEntries[0][1].avg_retention}% retention</div>
+            <div class="text-bright">{bestBpm[0]}</div>
+            <div class="text-xs text-dim">{bestBpm[1].avg_retention}% retention</div>
+          </div>
+        )}
+        {stems && (stems.stems_count ?? 0) > 0 && (
+          <div class="p-3 rounded bg-bg-2 border border-border">
+            <div class="text-xs text-dim">Stems vs Full Mix</div>
+            <div class="text-bright">{((stems.stems_avg_retention || 0) - (stems.no_stems_avg_retention || 0)).toFixed(1)}%</div>
+            <div class="text-xs text-dim">retention lift</div>
           </div>
         )}
       </div>

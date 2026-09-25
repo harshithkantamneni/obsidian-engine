@@ -1,9 +1,44 @@
 # The Obsidian Archive — Railway Deployment Checklist
 
 ## Overview
-This project runs as a **headless worker** on Railway.
-It has no HTTP server — the container runs `scheduler.py --daemon` continuously,
-producing videos on schedule and uploading them to YouTube.
+The container runs `scheduler.py --daemon` continuously, producing videos on
+schedule and handing them to the configured upload provider. **Publishing to
+YouTube is opt-in:** the default `providers.upload.name` in `obsidian.yaml` is
+`local`, which saves finished videos to `outputs/final/`. To publish, set:
+
+```yaml
+providers:
+  upload:
+    name: youtube
+```
+
+and complete Step 1a below. The scheduler logs a warning at startup if it finds
+YouTube credentials while the upload provider isn't `youtube`. The scheduler also starts the Flask
+dashboard/control API (`server/webhook_server.py`) on port **8080** (`PORT`),
+which serves the dashboard at `/`, the health check at `/health`, and the
+key-protected control endpoints (`/trigger`, `/kill`, `/api/setup/*`, ...).
+
+---
+
+## Security (read before exposing the port)
+
+- **Set `TRIGGER_KEY`** — every control endpoint returns `503` until it is set.
+  Generate one with `python -c "import secrets;print(secrets.token_urlsafe(32))"`.
+  Callers send it in the `X-Trigger-Key` header (`?key=` is accepted only on
+  the `/stream` SSE endpoint).
+- **Set `DASHBOARD_PASSWORD`** — without it the dashboard only works from
+  `localhost`; remote browsers never receive the trigger key.
+- **Set `FLASK_SECRET_KEY`** so login sessions survive restarts, and
+  `COOKIE_SECURE=true` when served over HTTPS.
+- The server binds to `127.0.0.1` unless `HOST` is set. The Docker image sets
+  `HOST=0.0.0.0` because a container must listen on all interfaces — so set
+  the keys above before publishing port 8080.
+- If you put a reverse proxy **on the same host** in front of the server,
+  requests appear to come from `127.0.0.1`; always set `DASHBOARD_PASSWORD`
+  in that setup.
+- On a fresh local (non-Docker) install with no `TRIGGER_KEY`, the setup
+  wizard is reachable from `127.0.0.1` only; saving it generates a
+  `TRIGGER_KEY` and writes it to `.env`.
 
 ---
 
@@ -14,8 +49,8 @@ The YouTube upload API requires an interactive OAuth flow that **cannot run insi
 You must generate `youtube_token.json` on your local machine first:
 
 ```bash
-cd ~/Desktop/Obsidian
-python3 11_youtube_uploader.py
+cd obsidian-engine
+python3 agents/11_youtube_uploader.py
 # Browser will open — log in with your YouTube channel account
 # Token is saved to youtube_token.json
 ```
@@ -28,8 +63,8 @@ In Railway dashboard → your service → **Variables** → add:
 ```
 YOUTUBE_TOKEN_JSON = <paste the full contents of youtube_token.json here>
 ```
-Then in `11_youtube_uploader.py`, the startup can write this back to disk.
-*(Or mount it as a volume — see Step 4.)*
+`scheduler.py` writes this back to `youtube_token.json` at startup
+(and `agents/11_youtube_uploader.py` also restores it from the env var).
 
 ---
 
@@ -58,26 +93,28 @@ Go to: Railway dashboard → your project → your service → **Variables**
 |---------------------------|---------------------------------------------------|
 | `YOUTUBE_TOKEN_JSON`      | Full JSON contents of `youtube_token.json`         |
 
+### Required — dashboard / API security
+
+| Variable             | Description                                              |
+|----------------------|----------------------------------------------------------|
+| `TRIGGER_KEY`        | Shared secret for the control API (see **Security**)     |
+| `DASHBOARD_PASSWORD` | Dashboard login password                                 |
+| `FLASK_SECRET_KEY`   | Session signing key (keeps logins valid across restarts) |
+
 ### Optional
 
 | Variable               | Description                                          |
 |------------------------|------------------------------------------------------|
+| `COOKIE_SECURE`        | `true` when the dashboard is served over HTTPS (Railway domains are) |
+| `HOST`                 | Bind address — the Dockerfile already sets `0.0.0.0` |
 | `PYTHONUNBUFFERED`     | Set to `1` (already in Dockerfile, but safe to repeat) |
 
 ---
 
-## Step 3 — Write youtube_token.json at container startup
+## Step 3 — YouTube token restore (already built in)
 
-Add this to the **top of `scheduler.py`** (after `load_dotenv`) so the token file
-is restored from the env var each time the container starts:
-
-```python
-# Restore YouTube token from env var (Railway secret)
-_token_json = os.getenv("YOUTUBE_TOKEN_JSON", "")
-if _token_json:
-    token_path = Path(__file__).parent / "youtube_token.json"
-    token_path.write_text(_token_json)
-```
+No code change is needed: `scheduler.py` already restores `youtube_token.json`
+from `YOUTUBE_TOKEN_JSON` at startup.
 
 ---
 
@@ -91,6 +128,11 @@ In Railway dashboard → your service → **Volumes**:
 - Size: start with **20 GB** (each video ~500MB–2GB rendered)
 
 > Without this volume, every restart loses all rendered content.
+
+> The image runs as the unprivileged `app` user (uid 1000). Railway mounts
+> volumes as root, so if logs show `Permission denied: '/app/outputs/...'`,
+> add the variable `RAILWAY_RUN_UID=0` (Railway's documented fix for
+> non-root images with volumes).
 
 ---
 
@@ -148,3 +190,21 @@ If you see import errors, check that all env vars in Step 2 are set.
 | `FATAL: Fact verification requires full rewrite` | Twist reveal unverifiable — topic needs to be re-queued with a different angle |
 | `Pipeline halted: script too short` | Claude returned < 1000 words — retry the topic |
 | Remotion render crash | Chrome deps missing — check Dockerfile build logs |
+
+---
+
+## Docker Compose (self-hosted)
+
+```bash
+cp .env.example .env            # fill in API keys, TRIGGER_KEY, DASHBOARD_PASSWORD
+mkdir -p data outputs remotion/public/music
+docker compose up -d --build
+```
+
+- Runtime state (`channel_insights.json`, `lessons_learned.json`) is stored in
+  `./data/`. Put `client_secrets.json` and `youtube_token.json` in `./data/`
+  too (or set `YOUTUBE_TOKEN_JSON` in `.env`).
+- The container runs as an unprivileged user (uid 1000). On Linux, if your
+  uid differs, build with `APP_UID=$(id -u) APP_GID=$(id -g) docker compose up -d --build`,
+  or `chown` the `data/` and `outputs/` directories to uid 1000.
+- Browse to `http://<host>:8080` and log in with `DASHBOARD_PASSWORD`.

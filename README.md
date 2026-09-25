@@ -123,7 +123,7 @@ You need **4 API keys** to get started. Total free credits cover your first 3-5 
 
 | Service | What For | Link |
 |---------|----------|------|
-| YouTube API | Auto-upload to YouTube | [Google Cloud Console](https://console.cloud.google.com) |
+| YouTube API | Auto-upload to YouTube (set `providers.upload.name: youtube`) | [Google Cloud Console](https://console.cloud.google.com) |
 | Supabase | Analytics database | [supabase.com](https://supabase.com) |
 | Epidemic Sound | Premium music + SFX | [epidemicsound.com](https://www.epidemicsound.com) |
 | Telegram | Pipeline notifications | [@BotFather](https://t.me/BotFather) |
@@ -162,22 +162,23 @@ profile: documentary     # Netflix/HBO style
 
 ## Pluggable Providers
 
-Swap any external service without touching code:
+Every external service (LLM, voice, images, footage, upload, music, SFX) goes through a provider, so you can swap any of them without touching code:
 
 ```yaml
 # obsidian.yaml
 providers:
   llm:     { name: openai }        # GPT instead of Claude
-  tts:     { name: elevenlabs }    # Default narrator
+  tts:     { name: elevenlabs }    # or: openai, epidemic_sound
   images:  { name: fal }           # AI image generation
   footage: { name: pexels }        # Stock B-roll
-  upload:  { name: local }         # Save to disk (or: youtube)
+  upload:  { name: local }         # Save to outputs/final/ (or: youtube to publish)
   music:   { name: auto }          # Epidemic Sound → local fallback
+  sfx:     { name: auto }
 ```
 
-Built-in: `anthropic`, `openai`, `elevenlabs`, `fal`, `pexels`, `local`, `epidemic_sound`
+Built-in: `anthropic`, `openai`, `elevenlabs`, `epidemic_sound`, `fal`, `pexels`, `local`, `youtube`
 
-Custom provider? Point to any class: `name: my_package.MyProvider`
+**Bring your own:** set `name` to the dotted path of your own class (e.g. `my_providers.tts.MyTTS`). Anything under `options:` is passed to its constructor. Run `python -m providers` to check that everything loads. [docs/PROVIDERS.md](docs/PROVIDERS.md) documents the interface for each type, and [examples/providers/](examples/providers/) has working templates.
 
 ## Dashboard
 

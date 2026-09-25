@@ -43,6 +43,32 @@ class EpidemicSFXProvider(SFXProvider):
         client = EpidemicSoundClient()
         return client.download_sfx(sfx_id, output_path)
 
+    # Scene-level selection: Epidemic API (cached per session by the SFX
+    # manager), falling back to the local files when the API returns nothing.
+    def sfx_for_scene(self, scene: dict, dest_dir: Path) -> str | None:
+        sfx = None
+        try:
+            from media.epidemic_sfx_manager import get_sfx_for_scene
+            sfx = get_sfx_for_scene(scene) or None
+        except Exception:
+            pass
+        if not sfx:
+            from providers.sfx.local import local_sfx_for_scene
+            sfx = local_sfx_for_scene(scene)
+        return sfx
+
+    def ambient_for_scene(self, scene: dict, dest_dir: Path) -> str | None:
+        amb = None
+        try:
+            from media.epidemic_sfx_manager import get_ambient_for_scene
+            amb = get_ambient_for_scene(scene) or None
+        except Exception:
+            pass
+        if not amb:
+            from providers.sfx.local import local_ambient_for_scene
+            amb = local_ambient_for_scene(scene)
+        return amb
+
     def check_status(self) -> dict:
         if not self._api_key:
             return {"status": "no_key"}

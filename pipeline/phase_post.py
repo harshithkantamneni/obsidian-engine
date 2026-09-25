@@ -62,7 +62,11 @@ def run_post_phase(
             thumbnail_path=_thumbnail_path,
         )
 
-    runner.run_stage(13, "YouTube Upload", do_upload)
+    runner.run_stage(13, "Upload", do_upload)
+    _on_youtube = _uploaded_to_youtube(ctx)
+    if not _on_youtube:
+        logger.info("[Pipeline] Upload provider is not YouTube — skipping YouTube analytics, "
+                    "comment analysis, param observation and community posts")
 
     # ── Record topic as covered ───────────────────────────────────────────────
     _record_topic(ctx)
@@ -70,19 +74,22 @@ def run_post_phase(
     # ── Save to Supabase ──────────────────────────────────────────────────────
     _save_to_supabase(ctx)
 
-    # ── Store param observation ───────────────────────────────────────────────
-    _store_param_observation(ctx)
+    # ── Store param observation (needs YouTube retention data) ────────────────
+    if _on_youtube:
+        _store_param_observation(ctx)
 
-    # ── Analytics agent ───────────────────────────────────────────────────────
-    try:
-        a12 = load_agent(Path("12_analytics_agent.py"))
-        logger.info("[Pipeline] Running analytics agent...")
-        a12.run()
-    except Exception as analytics_err:
-        logger.warning(f"[Pipeline] Analytics agent warning: {analytics_err}")
+    # ── Analytics agent (reads YouTube stats) ────────────────────────────────
+    if _on_youtube:
+        try:
+            a12 = load_agent(Path("12_analytics_agent.py"))
+            logger.info("[Pipeline] Running analytics agent...")
+            a12.run()
+        except Exception as analytics_err:
+            logger.warning(f"[Pipeline] Analytics agent warning: {analytics_err}")
 
     # ── Comment analysis ──────────────────────────────────────────────────────
-    _run_comment_analysis(ctx)
+    if _on_youtube:
+        _run_comment_analysis(ctx)
 
     # ── Localization (opt-in) ─────────────────────────────────────────────────
     if os.getenv("LOCALIZATION_ENABLED", "").lower() == "true":
@@ -129,7 +136,8 @@ def run_post_phase(
         pass
 
     # ── Community engagement ──────────────────────────────────────────────────
-    _run_community_engagement(ctx)
+    if _on_youtube:
+        _run_community_engagement(ctx)
 
     # ── Quality checks ────────────────────────────────────────────────────────
     _run_quality_report(ctx)
@@ -158,6 +166,25 @@ def run_post_phase(
 # ══════════════════════════════════════════════════════════════════════════════
 # Helper functions (extracted from inline code)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _uploaded_to_youtube(ctx: PipelineContext) -> bool:
+    """True if stage 13 published to YouTube.
+
+    Stage 13 results record the upload provider under "provider"; results
+    without it predate the provider system, when uploads always went to YouTube.
+    """
+    res = ctx.state.get("stage_13") or {}
+    if not isinstance(res, dict):
+        return False
+    return res.get("provider", "youtube") == "youtube"
+
+
+def _youtube_id(ctx: PipelineContext) -> str:
+    """Stage 13 video id if it is a YouTube id, else ""."""
+    res = ctx.state.get("stage_13") or {}
+    if not isinstance(res, dict) or not _uploaded_to_youtube(ctx):
+        return ""
+    return res.get("video_id", "")
 
 def _run_predictive_scoring(ctx: PipelineContext) -> None:
     try:
@@ -260,12 +287,11 @@ def _record_topic(ctx: PipelineContext) -> None:
         from server import topic_store
         angle_data = ctx.angle or ctx.state.get("stage_2", {}) or {}
         seo_data = ctx.seo or ctx.state.get("stage_6", {}) or {}
-        upload_res = ctx.state.get("stage_13", {}) or {}
         topic_store.record_topic(
             topic=ctx.topic,
             angle=angle_data.get("unique_angle", angle_data.get("chosen_angle", "")),
             title=seo_data.get("recommended_title", ctx.topic),
-            youtube_id=upload_res.get("video_id", ""),
+            youtube_id=_youtube_id(ctx),
         )
     except Exception as ts_err:
         logger.warning(f"[Pipeline] topic_store warning: {ts_err}")
@@ -302,8 +328,8 @@ def _save_to_supabase(ctx: PipelineContext) -> None:
             supabase_client.save_video(
                 topic=ctx.topic,
                 title=seo_data.get("recommended_title", ctx.topic),
-                youtube_url=upload_result.get("url", ""),
-                youtube_id=upload_result.get("video_id", ""),
+                youtube_url=upload_result.get("url", "") if _uploaded_to_youtube(ctx) else "",
+                youtube_id=_youtube_id(ctx),
                 script_path=ctx.state.get("script_path", ""),
                 video_path="",
                 duration_seconds=audio_saved.get("total_duration_seconds", 0),

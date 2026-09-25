@@ -12,6 +12,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from server.webhook_server import app, _validate_topic, _state, _lock
 
+TEST_KEY = "test-trigger-key"
+
+
+@pytest.fixture(autouse=True)
+def trigger_key(monkeypatch):
+    """Protected routes require a configured TRIGGER_KEY (never open by default)."""
+    monkeypatch.setattr("server.webhook_server.TRIGGER_KEY", TEST_KEY)
+    return TEST_KEY
+
 
 @pytest.fixture
 def client():
@@ -50,7 +59,7 @@ class TestHealth:
         assert r.data == b"OK"
 
     def test_status_returns_json(self, client):
-        r = client.get("/status", headers={"X-Trigger-Key": ""})
+        r = client.get("/status", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "running" in data
@@ -123,34 +132,34 @@ class TestEndpoints:
         assert b"OBSIDIAN" in r.data
 
     def test_costs_endpoint(self, client):
-        r = client.get("/costs", headers={"X-Trigger-Key": ""})
+        r = client.get("/costs", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "costs" in data or "error" in data
 
     def test_music_endpoint(self, client):
-        r = client.get("/music", headers={"X-Trigger-Key": ""})
+        r = client.get("/music", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "total_tracks" in data
         assert "tracks_by_mood" in data
 
     def test_trends_endpoint(self, client):
-        r = client.get("/trends", headers={"X-Trigger-Key": ""})
+        r = client.get("/trends", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
 
     def test_audit_endpoint(self, client):
-        r = client.get("/audit", headers={"X-Trigger-Key": ""})
+        r = client.get("/audit", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "entries" in data
 
     def test_history_endpoint(self, client):
-        r = client.get("/history", headers={"X-Trigger-Key": ""})
+        r = client.get("/history", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
 
     def test_stream_endpoint_sse(self, client):
-        r = client.get("/stream", headers={"X-Trigger-Key": ""})
+        r = client.get("/stream", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         assert "text/event-stream" in r.content_type
 
@@ -160,11 +169,11 @@ class TestEndpoints:
             _state["topic"] = "test"
         r = client.post("/trigger",
                         json={"topic": "Another topic"},
-                        headers={"X-Trigger-Key": ""})
+                        headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 409
 
     def test_kill_no_pipeline(self, client):
-        r = client.post("/kill", headers={"X-Trigger-Key": ""})
+        r = client.post("/kill", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 400
 
 
@@ -189,7 +198,7 @@ class TestDashboard:
 
 class TestApiPulse:
     def test_pulse_returns_all_keys(self, client):
-        r = client.get("/api/pulse", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/pulse", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         expected_keys = {
@@ -202,13 +211,13 @@ class TestApiPulse:
     def test_pulse_exempt_from_rate_limit(self, client):
         """20 rapid calls should all succeed (no rate limit on pulse)."""
         for _ in range(20):
-            r = client.get("/api/pulse", headers={"X-Trigger-Key": ""})
+            r = client.get("/api/pulse", headers={"X-Trigger-Key": TEST_KEY})
             assert r.status_code == 200
 
     def test_pulse_graceful_when_supabase_down(self, client):
         """queue_depth should fallback to 0 when Supabase is unreachable."""
         with patch("server.webhook_server._get_queue_depth", side_effect=Exception("connection refused")):
-            r = client.get("/api/pulse", headers={"X-Trigger-Key": ""})
+            r = client.get("/api/pulse", headers={"X-Trigger-Key": TEST_KEY})
             assert r.status_code == 200
             data = r.get_json()
             assert isinstance(data["queue_depth"], int)
@@ -220,7 +229,7 @@ class TestApiPulse:
         def hit_pulse():
             try:
                 with app.test_client() as c:
-                    r = c.get("/api/pulse", headers={"X-Trigger-Key": ""})
+                    r = c.get("/api/pulse", headers={"X-Trigger-Key": TEST_KEY})
                     data = r.get_json()
                     if "status" not in data:
                         errors.append("missing status key")
@@ -237,14 +246,14 @@ class TestApiPulse:
 
 class TestApiDashboard:
     def test_summary_always_returns_5_signals(self, client):
-        r = client.get("/api/dashboard?sections=summary", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/dashboard?sections=summary", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "summary" in data
         assert len(data["summary"]["signals"]) == 5
 
     def test_performance_excludes_other_sections(self, client):
-        r = client.get("/api/dashboard?sections=performance", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/dashboard?sections=performance", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "performance" in data
@@ -252,21 +261,21 @@ class TestApiDashboard:
         assert "config" not in data
 
     def test_multi_section_request(self, client):
-        r = client.get("/api/dashboard?sections=performance,audience", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/dashboard?sections=performance,audience", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "performance" in data
         assert "audience" in data
 
     def test_invalid_section_returns_empty(self, client):
-        r = client.get("/api/dashboard?sections=invalid", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/dashboard?sections=invalid", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert data == {}
 
     def test_missing_insights_returns_empty_sections(self, client):
         """When channel_insights.json doesn't exist, sections return empty data."""
-        r = client.get("/api/dashboard?sections=performance", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/dashboard?sections=performance", headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 200
         data = r.get_json()
         assert "performance" in data
@@ -275,12 +284,12 @@ class TestApiDashboard:
 
 class TestCacheControl:
     def test_pulse_has_no_cache(self, client):
-        r = client.get("/api/pulse", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/pulse", headers={"X-Trigger-Key": TEST_KEY})
         assert "no-cache" in r.headers.get("Cache-Control", "")
         assert "no-store" in r.headers.get("Cache-Control", "")
 
     def test_dashboard_api_has_no_cache(self, client):
-        r = client.get("/api/dashboard?sections=summary", headers={"X-Trigger-Key": ""})
+        r = client.get("/api/dashboard?sections=summary", headers={"X-Trigger-Key": TEST_KEY})
         assert "no-cache" in r.headers.get("Cache-Control", "")
 
     def test_error_response_has_no_cache(self, client):
@@ -369,5 +378,5 @@ class TestMaxContentLength:
         r = client.post("/trigger",
                         data=large_body,
                         content_type="application/json",
-                        headers={"X-Trigger-Key": ""})
+                        headers={"X-Trigger-Key": TEST_KEY})
         assert r.status_code == 413

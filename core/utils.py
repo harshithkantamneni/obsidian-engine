@@ -9,7 +9,9 @@ from typing import Union
 
 def atomic_write_json(path: Path, data: Union[dict, list]):
     """Write JSON atomically via temp file + rename to prevent corruption."""
-    path = Path(path)
+    # resolve() follows symlinks, so a file symlinked into a mounted data dir
+    # (Docker ./data) is replaced in place instead of the link being clobbered.
+    path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
