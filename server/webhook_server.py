@@ -2232,6 +2232,36 @@ def _validate_setup_payload(data: dict):
     return keys, profile, providers, errors
 
 
+def _overwrite_fd(fd: int, data: bytes):
+    """Replace everything in the open file with data."""
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _write_in_place(path: Path, data: bytes, mode: int):
+    """Overwrite path in place, keeping its inode. If the write fails, the
+    old bytes are written back (best effort) before the error is raised."""
+    original = path.read_bytes()
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        try:
+            os.fchmod(fd, mode)  # may be refused on a bind mount
+        except OSError:
+            pass
+        try:
+            _overwrite_fd(fd, data)
+        except BaseException:
+            try:
+                _overwrite_fd(fd, original)
+            except OSError:
+                pass  # nothing more to try; the first error is the one to report
+            raise
+    finally:
+        os.close(fd)
+
+
 def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644,
                        clear_bits: int = 0):
     """Write via tmp + os.replace, keeping the file's mode minus ``clear_bits``
@@ -2250,13 +2280,7 @@ def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644,
             os.replace(tmp, path)
         except OSError:
             os.unlink(tmp)
-            fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
-            try:
-                os.fchmod(fd, mode)  # may be refused on a bind mount
-            except OSError:
-                pass
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_in_place(path, content.encode("utf-8"), mode)
     except BaseException:
         try:
             os.unlink(tmp)

@@ -318,7 +318,7 @@ class TestSetupSave:
 
     def test_in_place_fallback_when_replace_fails(self, client, with_key, setup_files, monkeypatch):
         env_path, _ = setup_files
-        env_path.write_text("FAL_KEY=old\n")
+        env_path.write_text("FAL_KEY=older\n")  # longer than the new value: checks truncation
         env_path.chmod(0o644)
         inode = env_path.stat().st_ino
 
@@ -332,6 +332,35 @@ class TestSetupSave:
         assert env_path.stat().st_ino == inode
         assert env_path.stat().st_mode & 0o777 == 0o640
         assert sorted(p.name for p in env_path.parent.iterdir()) == [".env", "obsidian.yaml"]
+
+    def test_failed_in_place_write_restores_the_original(self, client, with_key, setup_files,
+                                                         monkeypatch):
+        env_path, _ = setup_files
+        env_path.write_text("FAL_KEY=old\nB=2\n")
+        inode = env_path.stat().st_ino
+        real_write = os.write
+        new_writes = []
+
+        def busy_replace(*args, **kwargs):
+            raise OSError(16, "Device or resource busy")
+
+        def short_write_then_disk_full(fd, data):
+            if b"new" not in data:
+                return real_write(fd, data)  # the restore
+            new_writes.append(len(data))
+            if len(new_writes) == 1:
+                return real_write(fd, data[:4])
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(ws.os, "replace", busy_replace)
+        monkeypatch.setattr(ws.os, "write", short_write_then_disk_full)
+        r = self._save(client, {"keys": {"FAL_KEY": "new"}})
+        assert r.get_json()["success"] is False
+        assert new_writes == [16, 12]  # the retry sends only what the short write missed
+        assert env_path.read_text() == "FAL_KEY=old\nB=2\n"
+        assert env_path.stat().st_ino == inode
+        assert sorted(p.name for p in env_path.parent.iterdir()) == [".env", "obsidian.yaml"]
+        assert os.environ.get("FAL_KEY") != "new"
 
     def test_save_keeps_other_lines_byte_for_byte(self, client, with_key, setup_files):
         env_path, _ = setup_files
