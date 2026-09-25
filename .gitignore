@@ -58,7 +58,6 @@ htmlcov/
 .ruff_cache/
 
 # Dashboard build
-dashboard/dist/
 dashboard/node_modules/
 
 # Remotion build
