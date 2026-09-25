@@ -71,8 +71,10 @@ The `style_directive` block is injected into every AI agent's prompt. It's the s
    ```yaml
    providers:
      tts:
-       name: openai_tts
+       name: openai          # the key in _BUILTIN_PROVIDERS, not the file name
    ```
+
+Custom providers need no registration: set `name: my_module.MyClass` (a subclass of the matching base in `providers/base.py`, importable from the project root or as an installed package) and pass its constructor arguments under `options:`. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 ## What to Contribute
 
