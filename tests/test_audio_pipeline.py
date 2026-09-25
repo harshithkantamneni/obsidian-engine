@@ -517,15 +517,14 @@ class TestEdgeCases:
         assert words[0]["start"] == 1.0
         assert words[0]["end"] == 1.15
 
-    def test_missing_api_key_raises(self):
-        """Missing ELEVENLABS_API_KEY should raise RuntimeError."""
-        import os
-        env_backup = os.environ.get("ELEVENLABS_API_KEY")
-        try:
-            os.environ.pop("ELEVENLABS_API_KEY", None)
-            from pipeline.audio import run_audio
-            with pytest.raises(RuntimeError, match="ELEVENLABS_API_KEY"):
-                run_audio({"full_script": "Test script."})
-        finally:
-            if env_backup is not None:
-                os.environ["ELEVENLABS_API_KEY"] = env_backup
+    def test_missing_api_key_raises(self, tmp_path, monkeypatch):
+        """Missing ELEVENLABS_API_KEY → the ElevenLabs provider raises RuntimeError."""
+        import pipeline.audio as audio_mod
+        from providers import registry
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+        monkeypatch.setattr(audio_mod, "CHUNKS_DIR", tmp_path)
+        monkeypatch.setattr(audio_mod, "MEDIA_DIR", tmp_path)
+        registry.clear_cache()
+        with pytest.raises(RuntimeError, match="ELEVENLABS_API_KEY"):
+            audio_mod.run_audio({"full_script": "Test script."})
+        registry.clear_cache()

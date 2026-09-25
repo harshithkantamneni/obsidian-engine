@@ -3,7 +3,6 @@ import sys
 import json
 import re
 import time
-import base64
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,8 +15,122 @@ from pipeline.voice import _get_scene_voice_settings, _get_inter_scene_pause, _g
 logger = get_logger(__name__)
 
 
+# ── TTS provider plumbing (shared with pipeline/shorts.py) ─────────────────
+
+_even_split_warned = False
+
+
+def _audio_duration(path) -> float:
+    try:
+        from mutagen import File as _MFile
+        info = _MFile(str(path))
+        if info is not None and info.info:
+            return float(info.info.length)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _is_pipeline_mp3(path: Path) -> bool:
+    """True if path is a 44.1kHz MP3 (the format ElevenLabs returns).
+
+    Chunks are joined with ``ffmpeg -c copy`` next to 44.1kHz mono silence
+    files, so every chunk must share that sample rate; anything else (e.g.
+    24kHz MP3 or WAV from another provider) is transcoded.
+    """
+    try:
+        from mutagen.mp3 import MP3
+        info = MP3(str(path)).info
+        return info.sample_rate == 44100
+    except Exception:
+        return False
+
+
+def _store_chunk_audio(src: Path, chunk_path: Path) -> None:
+    """Move/transcode a provider's audio file into chunk_path as MP3 44.1kHz mono."""
+    src = Path(src)
+    if src.suffix.lower() == ".mp3" and _is_pipeline_mp3(src):
+        shutil.copyfile(src, chunk_path)
+    else:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-ar", "44100", "-ac", "1",
+             "-c:a", "libmp3lame", "-b:a", "192k", str(chunk_path)],
+            check=True, capture_output=True,
+        )
+    # Clean up provider temp files (never delete files a provider keeps elsewhere)
+    try:
+        import tempfile
+        if Path(tempfile.gettempdir()).resolve() in src.resolve().parents:
+            src.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _even_word_split(text: str, duration: float) -> list[dict]:
+    words = text.split()
+    if not words:
+        return []
+    duration = duration or len(words) * 0.4
+    per = duration / len(words)
+    return [{"word": w, "start": round(i * per, 3), "end": round((i + 1) * per, 3)}
+            for i, w in enumerate(words)]
+
+
+def _align_chunk_words(chunk_path: Path, text: str) -> list[dict]:
+    """Word timestamps for a chunk whose TTS provider returned none.
+
+    Uses media/forced_alignment (Whisper if installed); if that is unavailable
+    or fails, spreads words evenly over the chunk duration.
+    """
+    global _even_split_warned
+    try:
+        from media.forced_alignment import align_audio_to_text
+        words = align_audio_to_text(Path(chunk_path), text)
+        if words:
+            return words
+    except Exception as e:
+        logger.debug(f"[Audio] Forced alignment failed: {e}")
+    if not _even_split_warned:
+        _even_split_warned = True
+        logger.warning("[Audio] TTS provider returned no word timestamps and forced alignment "
+                       "is unavailable — spreading words evenly (captions will be approximate). "
+                       "Install openai-whisper for accurate captions.")
+    return _even_word_split(text, _audio_duration(chunk_path))
+
+
+def synthesize_chunk(tts, text: str, chunk_path: Path, voice_settings=None,
+                     speed: float = 1.0, role: str = "narrator") -> list[dict]:
+    """Synthesize one chunk with the configured TTS provider.
+
+    Writes MP3 audio to chunk_path and returns word timestamps relative to the
+    start of the chunk. Timestamps come from the provider when it has them,
+    otherwise from forced alignment (see _align_chunk_words).
+    """
+    voice_id = tts.resolve_voice(role) or None
+    audio_file, words = tts.synthesize(text, voice_id=voice_id,
+                                       voice_settings=voice_settings, speed=speed)
+    _store_chunk_audio(Path(audio_file), Path(chunk_path))
+    words = [
+        {"word": str(w["word"]), "start": round(float(w["start"]), 3), "end": round(float(w["end"]), 3)}
+        for w in (words or []) if str(w.get("word", "")).strip()
+    ]
+    if not words:
+        words = _align_chunk_words(Path(chunk_path), text)
+    return words
+
+
+def _log_tts_cost(n_chars: int) -> None:
+    try:
+        from core.cost_tracker import get_active_run_id, log_cost
+        from providers.registry import get_provider_name
+        _rid = get_active_run_id()
+        if _rid:
+            log_cost(_rid, "audio", get_provider_name("tts"), n_chars, "characters")
+    except Exception:
+        pass
+
+
 def run_audio(script_data, scene_data=None, display_script=None):
-    import requests
     try:
         from mutagen.mp3 import MP3
     except ImportError:
@@ -25,9 +138,11 @@ def run_audio(script_data, scene_data=None, display_script=None):
         subprocess.run([sys.executable, "-m", "pip", "install", "mutagen"], check=True)
         from mutagen.mp3 import MP3
 
-    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("ELEVENLABS_API_KEY not set — cannot generate audio")
+    # TTS provider from obsidian.yaml (providers.tts). Each provider raises its
+    # own clear error if credentials are missing.
+    from providers.registry import get_provider
+    tts = get_provider("tts")
+
     # Voice config from obsidian.yaml (via pipeline_config)
     from core.pipeline_config import (
         NARRATOR_VOICE_ID, QUOTE_VOICE_ID as _QUOTE_VID,
@@ -63,80 +178,12 @@ def run_audio(script_data, scene_data=None, display_script=None):
              'announced', 'commanded', 'stated', 'replied', 'exclaimed']
         )
 
-    def generate_chunk(text, voice_settings=None, voice_id=None, speed=None):
-        if voice_settings is None:
-            voice_settings = VOICE_BODY
-        if voice_id is None:
-            voice_id = VOICE_ID
-        if speed is None:
-            speed = VOICE_SPEED
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
-        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-        payload = {
-            "text": text, "model_id": "eleven_v3",
-            "voice_settings": voice_settings,
-            "speed": speed,
-        }
-        last_err = None
-        for attempt in range(5):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=120)
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as ce:
-                wait = 30 * (attempt + 1)
-                logger.warning(f"  Connection/timeout error, waiting {wait}s...")
-                time.sleep(wait)
-                last_err = ce
-                continue
-            if r.status_code == 200:
-                return json.loads(r.text, strict=False)
-            elif r.status_code == 429:
-                wait = 60 * (attempt + 1)
-                logger.warning(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/5)...")
-                time.sleep(wait)
-                last_err = Exception("ElevenLabs rate limit (429)")
-            elif r.status_code in (500, 502, 503):
-                wait = 30 * (attempt + 1)
-                logger.warning(f"  Server error ({r.status_code}), waiting {wait}s (attempt {attempt+1}/5)...")
-                time.sleep(wait)
-                last_err = Exception(f"ElevenLabs server error ({r.status_code})")
-            else:
-                raise Exception(f"ElevenLabs {r.status_code}: {r.text[:200]}")
-        raise last_err or Exception("Failed after 5 attempts")
-
-    def extract_word_timestamps(data):
-        """Extract word-level timestamps from ElevenLabs character alignment."""
-        alignment = data.get("alignment") or {}
-        if not isinstance(alignment, dict):
-            alignment = {}
-        chars  = alignment.get("characters", [])
-        starts = alignment.get("character_start_times_seconds", [])
-        ends   = alignment.get("character_end_times_seconds", [])
-
-        chunk_words = []
-        word, word_start, last_end = "", None, 0.0
-        for j, ch in enumerate(chars):
-            if ch in (" ", "\n"):
-                if word and word_start is not None:
-                    end_idx = j - 1
-                    word_end = ends[end_idx] if 0 <= end_idx < len(ends) else word_start + max(0.15, len(word) * 0.08)
-                    chunk_words.append({"word": word, "start": round(word_start, 3),
-                        "end": round(word_end, 3)})
-                    word, word_start = "", None
-            else:
-                if word_start is None and j < len(starts):
-                    word_start = starts[j]
-                word += ch
-                if j < len(ends):
-                    last_end = ends[j]
-        if word and word_start is not None:
-            chunk_words.append({"word": word, "start": round(word_start, 3), "end": round(last_end, 3)})
-        return chunk_words
-
     # ── Determine chunking strategy ───────────────────────────────────────────
     # Scene-aware: chunk by scene narration with mood-specific voice settings
     # Legacy: chunk by text splitting with keyword-based prosody detection
 
     all_scenes = []
+    scenes = []
     if scene_data and isinstance(scene_data, dict):
         all_scenes = scene_data.get("scenes", [])
 
@@ -324,21 +371,11 @@ def run_audio(script_data, scene_data=None, display_script=None):
                   f"stab={plan['vs'].get('stability', '?')}, "
                   f"style={plan['vs'].get('style', '?')}, "
                   f"spd={plan['spd']})...")
-            data = generate_chunk(plan["text"], voice_settings=plan["vs"],
-                                  voice_id=plan["vid"], speed=plan["spd"])
-            audio_bytes = base64.b64decode(data.get("audio_base64", ""))
-            chunk_path.write_bytes(audio_bytes)
-
-            # Log ElevenLabs cost
-            try:
-                from core.cost_tracker import get_active_run_id, log_cost
-                _rid = get_active_run_id()
-                if _rid:
-                    log_cost(_rid, "audio", "elevenlabs", len(plan["text"]), "characters")
-            except Exception:
-                pass
-
-            chunk_words = extract_word_timestamps(data)
+            role = "quote" if plan["vid"] == QUOTE_VOICE_ID else "narrator"
+            chunk_words = synthesize_chunk(tts, plan["text"], chunk_path,
+                                           voice_settings=plan["vs"], speed=plan["spd"],
+                                           role=role)
+            _log_tts_cost(len(plan["text"]))
 
             with open(chunk_ts, "w") as f:
                 json.dump(chunk_words, f)
