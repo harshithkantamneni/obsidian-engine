@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.paths import MEDIA_DIR, REMOTION_SRC, REMOTION_PUBLIC
 from core.log import get_logger
+from pipeline.audio_assets import select_background_music, select_scene_ambient, select_scene_sfx
 
 logger = get_logger(__name__)
 
@@ -124,43 +125,16 @@ def run_convert(manifest, audio_data, topic="", era=""):
                 shutil.copy2(src, dest)
                 ai_image_name = src.name
 
-        # Ambient sound per scene mood — try Epidemic API first, fallback to local
-        ambient_file = None
-        if os.getenv("EPIDEMIC_SOUND_API_KEY"):
-            try:
-                from media.epidemic_sfx_manager import get_ambient_for_scene
-                ambient_file = get_ambient_for_scene(scene) or None
-            except Exception:
-                pass
-        if not ambient_file:
-            try:
-                from scripts.setup_ambience import get_ambient_file
-                ambient_file = get_ambient_file(
-                    scene.get("mood", "dark"),
-                    location=scene.get("location", ""),
-                    visual_desc=scene.get("visual_description", ""),
-                ) or None
-            except Exception:
-                pass
+        # Ambient sound per scene mood — via providers.sfx (built-ins: Epidemic API → local)
+        ambient_file = select_scene_ambient(scene, REMOTION_PUBLIC)
 
-        # SFX one-shot per scene (only on key moments) — try Epidemic API first
+        # SFX one-shot per scene (only on key moments) — via providers.sfx
         sfx_file = None
         sfx_start_offset = 0
         try:
             from scripts.setup_sfx import should_play_sfx
             if should_play_sfx(scene):
-                if os.getenv("EPIDEMIC_SOUND_API_KEY"):
-                    try:
-                        from media.epidemic_sfx_manager import get_sfx_for_scene
-                        sfx_file = get_sfx_for_scene(scene) or None
-                    except Exception:
-                        pass
-                if not sfx_file:
-                    try:
-                        from scripts.setup_sfx import get_sfx_file
-                        sfx_file = get_sfx_file(scene.get("mood", "dramatic")) or None
-                    except Exception:
-                        pass
+                sfx_file = select_scene_sfx(scene, REMOTION_PUBLIC)
                 # Align SFX to reveal word timestamp if available
                 if sfx_file and scene.get("is_reveal_moment") and words:
                     scene_words = [w for w in words
@@ -245,47 +219,8 @@ def run_convert(manifest, audio_data, topic="", era=""):
             split_scenes.append(scene)
     remotion_scenes = split_scenes
 
-    # Select background music — try smart selection first, fall back to random, then local files
-    music_file = None
-    music_start_offset = 0
-    try:
-        from media import music_manager
-        smart_result = music_manager.get_smart_music_for_video(remotion_scenes, total_duration)
-        if smart_result:
-            music_file = smart_result["music_file"]
-            music_start_offset = smart_result["music_start_offset"]
-            logger.info(f"[Convert] Smart music: {music_file} (offset={music_start_offset:.1f}s, "
-                  f"corr={smart_result['correlation_score']:.3f})")
-        else:
-            music_file = music_manager.get_music_for_video(remotion_scenes, total_duration)
-            if music_file:
-                logger.info(f"[Convert] Background music (random): {music_file}")
-    except Exception as _music_err:
-        logger.warning(f"[Convert] Music manager unavailable: {_music_err}")
-
-    # Fallback: local mood-mapped files
-    if not music_file:
-        mood_counts = {}
-        for s in remotion_scenes:
-            m = s.get("mood", "dark")
-            mood_counts[m] = mood_counts.get(m, 0) + 1
-        dominant_mood = max(mood_counts, key=mood_counts.get) if mood_counts else "dark"
-        MOOD_MUSIC = {
-            "dark":      "music/dark_01_scp_x1x.mp3",
-            "tense":     "music/tense_01_stay_the_course.mp3",
-            "dramatic":  "music/dramatic_01_strength_of_titans.mp3",
-            "cold":      "music/cold_01_scp_x5x.mp3",
-            "reverent":  "music/reverent_01_ancient_rite.mp3",
-            "wonder":    "music/wonder_01_the_descent.mp3",
-            "warmth":    "music/warmth_01_hearth_and_home.mp3",
-            "absurdity": "music/absurdity_01_scheming_weasel.mp3",
-        }
-        local_file = MOOD_MUSIC.get(dominant_mood, MOOD_MUSIC["dark"])
-        if (REMOTION_PUBLIC / local_file).exists():
-            music_file = local_file
-            logger.info(f"[Convert] Background music (local): {music_file} (mood: {dominant_mood})")
-        else:
-            logger.warning("[Convert] No background music available")
+    # Select background music — providers.music first, then local library fallbacks
+    music_file, music_start_offset = select_background_music(remotion_scenes, total_duration, REMOTION_PUBLIC)
 
     # Attempt track adaptation (exact duration + stems) if API available
     music_adapted = False
