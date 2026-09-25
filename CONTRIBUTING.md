@@ -80,7 +80,7 @@ Custom providers need no registration: set `name: my_module.MyClass` (a subclass
 
 Good first issues:
 - Add a new content profile (e.g., `profiles/tutorial.yaml`, `profiles/gaming.yaml`)
-- Add a new provider (e.g., OpenAI TTS, Replicate images, local Ollama)
+- Add a new provider (e.g., Pixabay footage [#2](https://github.com/harshithkantamneni/obsidian-engine/issues/2), Replicate images, local Ollama)
 - Improve documentation
 - Add test coverage
 

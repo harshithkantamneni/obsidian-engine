@@ -72,20 +72,20 @@ YOUTUBE_TOKEN_JSON = <paste the full contents of youtube_token.json here>
 
 Go to: Railway dashboard → your project → your service → **Variables**
 
-### Required — pipeline will fail without these
+### Keys for the default providers and the scheduler
+
+The first four are needed only while `obsidian.yaml` uses the built-in default
+providers. If you switch a provider, set its key instead (see
+[docs/PROVIDERS.md](docs/PROVIDERS.md)). Supabase holds the scheduler's topic queue.
 
 | Variable             | Description                                              |
 |----------------------|----------------------------------------------------------|
-| `ANTHROPIC_API_KEY`  | Claude API key — used by every agent                     |
-| `ELEVENLABS_API_KEY` | ElevenLabs TTS API key — Stage 8 audio production        |
-| `FAL_KEY`            | fal.ai key — Stage 10 AI image generation                |
-| `FAL_API_KEY`        | **Must match `FAL_KEY`** — `run_pipeline.py` reads this name specifically (`os.getenv("FAL_API_KEY")`) |
-| `PEXELS_API_KEY`     | Pexels video search — Stage 9 footage hunting            |
+| `ANTHROPIC_API_KEY`  | Default `llm` provider (`anthropic`); the weekly competitor thumbnail analysis also uses it with any LLM provider |
+| `ELEVENLABS_API_KEY` | Default `tts` provider (`elevenlabs`), Stage 8 audio production |
+| `FAL_KEY`            | Default `images` provider (`fal`), Stage 10 AI image generation. `FAL_API_KEY` also works; set one of them |
+| `PEXELS_API_KEY`     | Default `footage` provider (`pexels`), Stage 9 footage hunting |
 | `SUPABASE_URL`       | Your Supabase project URL (`https://xxx.supabase.co`)    |
 | `SUPABASE_KEY`       | Supabase `service_role` or `anon` key                    |
-
-> ⚠️ **Note on `FAL_KEY` vs `FAL_API_KEY`:** Set **both** to the same value.
-> The fal-client SDK reads `FAL_KEY`; `run_pipeline.py` reads `FAL_API_KEY`.
 
 ### Required — for YouTube upload & analytics
 

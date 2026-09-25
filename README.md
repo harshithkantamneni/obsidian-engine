@@ -109,14 +109,16 @@ python run_pipeline.py "The Roman Empire" --from-stage 8  # Re-run from narratio
 
 ## API Keys
 
-You need **4 API keys** to get started. Total free credits cover your first 3-5 videos:
+You need keys only for the providers you configure in `obsidian.yaml`. The built-in defaults use these four:
 
-| Service | What For | Free Tier | Link |
-|---------|----------|-----------|------|
-| **Anthropic** | Script writing, research, all AI reasoning | $5 credit | [console.anthropic.com](https://console.anthropic.com) |
-| **ElevenLabs** | Voice narration | 10K chars/mo | [elevenlabs.io](https://elevenlabs.io) |
-| **fal.ai** | AI image generation | $10 credit | [fal.ai](https://fal.ai) |
-| **Pexels** | Stock footage | Unlimited | [pexels.com/api](https://www.pexels.com/api/new/) |
+| Service | Provider (type) | Env var | What For | Free Tier | Link |
+|---------|-----------------|---------|----------|-----------|------|
+| **Anthropic** | `anthropic` (`llm`) | `ANTHROPIC_API_KEY` | Script writing, research, all AI reasoning | $5 credit | [console.anthropic.com](https://console.anthropic.com) |
+| **ElevenLabs** | `elevenlabs` (`tts`) | `ELEVENLABS_API_KEY` | Voice narration | 10K chars/mo | [elevenlabs.io](https://elevenlabs.io) |
+| **fal.ai** | `fal` (`images`) | `FAL_KEY` | AI image generation | $10 credit | [fal.ai](https://fal.ai) |
+| **Pexels** | `pexels` (`footage`) | `PEXELS_API_KEY` | Stock footage | Free (200 req/hr) | [pexels.com/api](https://www.pexels.com/api/new/) |
+
+The other defaults need no key: `upload: local` saves to `outputs/final/`, and `music: auto` / `sfx: auto` in the shipped `obsidian.yaml` use Epidemic Sound only when `EPIDEMIC_SOUND_API_KEY` is set. If you switch a provider, set its key instead: `openai` (LLM or TTS) reads `OPENAI_API_KEY`, and Ollama through the `openai` provider's `base_url` needs none. See [docs/PROVIDERS.md](docs/PROVIDERS.md). Two features call Claude directly whatever LLM you use, and report an error without `ANTHROPIC_API_KEY`: the scheduler's weekly competitor thumbnail analysis and the vision passes of the manual content auditor (`agents/13_content_auditor.py`).
 
 <details>
 <summary><b>Optional services</b> (analytics, auto-upload, notifications)</summary>
