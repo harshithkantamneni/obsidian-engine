@@ -91,6 +91,16 @@ def splice_silence(src, dst, at_seconds: float, silence_seconds: float) -> bool:
         return False
 
 
+def _find_reflection_boundary(remotion_scenes):
+    """Index of the first 'ending' scene that directly follows an 'act3' scene, or None."""
+    for idx in range(len(remotion_scenes) - 1):
+        curr_pos = remotion_scenes[idx].get("narrative_position", "")
+        next_pos = remotion_scenes[idx + 1].get("narrative_position", "")
+        if curr_pos == "act3" and next_pos == "ending":
+            return idx + 1
+    return None
+
+
 def _inject_reflection_scene(remotion_scenes, words, total_duration, src_audio, dst_audio,
                              splice_fn=None):
     """Insert a synthetic reflection scene at the act3→ending boundary.
@@ -105,13 +115,7 @@ def _inject_reflection_scene(remotion_scenes, words, total_duration, src_audio, 
     copy the narration verbatim).
     """
     splice_fn = splice_fn or splice_silence
-    inject_idx = None
-    for idx in range(len(remotion_scenes) - 1):
-        curr_pos = remotion_scenes[idx].get("narrative_position", "")
-        next_pos = remotion_scenes[idx + 1].get("narrative_position", "")
-        if curr_pos == "act3" and next_pos == "ending":
-            inject_idx = idx + 1
-            break
+    inject_idx = _find_reflection_boundary(remotion_scenes)
     if inject_idx is None:
         return remotion_scenes, words, total_duration, False
 
@@ -382,8 +386,15 @@ def run_convert(manifest, audio_data, topic="", era=""):
         if _music_track_id:
             try:
                 from media.track_adapter import adapt_to_duration
+                # The reflection beat (injected later) lengthens the video; fit the
+                # track to the final length so a non-looping adapted track doesn't
+                # end early. If injection is later skipped the track is merely
+                # trimmed by the render.
+                _music_target = total_duration + (
+                    REFLECTION_DURATION if _find_reflection_boundary(remotion_scenes) is not None else 0.0
+                )
                 adapted = adapt_to_duration(
-                    _music_track_id, total_duration,
+                    _music_track_id, _music_target,
                     scenes=remotion_scenes,
                     download_stems=True,
                 )
