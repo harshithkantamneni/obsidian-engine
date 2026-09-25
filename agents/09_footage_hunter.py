@@ -12,7 +12,7 @@ from pathlib import Path
 _BASE = Path(__file__).resolve().parent.parent
 sys.path.append(str(_BASE))
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(dotenv_path=_BASE / ".env", interpolate=False)
 
 _CACHE_FILE = _BASE / "outputs" / "footage_cache.json"
 _CACHE_TTL = 7 * 24 * 3600  # 7 days

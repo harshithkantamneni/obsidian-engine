@@ -19,7 +19,7 @@ import glob
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", interpolate=False)
 
 SECRETS_FILE = Path(__file__).resolve().parent.parent / "client_secrets.json"
 TOKEN_FILE   = Path(__file__).resolve().parent.parent / "youtube_token.json"

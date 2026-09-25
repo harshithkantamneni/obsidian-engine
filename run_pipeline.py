@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", interpolate=False)
 
 # Allow OAuth over HTTP on Railway (internal proxy handles HTTPS externally)
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")

@@ -22,17 +22,22 @@ import re
 import os
 from pathlib import Path
 
-# Load .env if present
-_env_file = Path(__file__).resolve().parent.parent / ".env"
-if _env_file.exists():
-    for _line in _env_file.read_text().splitlines():
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _v = _line.split("=", 1)
-            _v = _v.strip()
-            if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in ('"', "'"):
-                _v = _v[1:-1]
-            os.environ.setdefault(_k.strip(), _v)
+from dotenv import dotenv_values
+
+
+def _load_env_file(path: Path) -> None:
+    """Load .env into os.environ without overriding variables already set.
+
+    Values are taken literally: ${VAR} references are not expanded.
+    """
+    if not path.exists():
+        return
+    for key, value in dotenv_values(path, interpolate=False).items():
+        if value is not None:
+            os.environ.setdefault(key, value)
+
+
+_load_env_file(Path(__file__).resolve().parent.parent / ".env")
 
 # Model constants (from obsidian.yaml → models.*)
 try:
