@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import yaml
 from pathlib import Path
 
@@ -52,8 +53,15 @@ def _resolve_profile_name() -> str:
     return "documentary"
 
 
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _load_profile(name: str) -> dict:
     """Load a profile YAML file by name."""
+    # Reject path separators / traversal ("../x", "/etc/x") — names only.
+    if not isinstance(name, str) or not _PROFILE_NAME_RE.match(name):
+        logger.warning(f"[Profile] Invalid profile name {name!r}, falling back to documentary")
+        name = "documentary"
     profile_path = PROFILES_DIR / f"{name}.yaml"
     if not profile_path.exists():
         logger.warning(f"[Profile] '{name}' not found at {profile_path}, falling back to documentary")

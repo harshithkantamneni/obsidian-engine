@@ -10,6 +10,7 @@ import sys
 import json
 import re
 import hmac
+import secrets
 import time as _time
 import threading
 import subprocess
@@ -51,31 +52,62 @@ BASE_DIR      = Path(__file__).resolve().parent.parent
 LESSONS_FILE  = BASE_DIR / "lessons_learned.json"
 INSIGHTS_FILE = BASE_DIR / "channel_insights.json"
 PORT         = int(os.getenv("PORT", 8080))
-TRIGGER_KEY  = os.getenv("TRIGGER_KEY", "")
+# Bind address. Defaults to loopback so a fresh local install is not exposed
+# to the network; containers set HOST=0.0.0.0 explicitly.
+HOST         = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
+TRIGGER_KEY  = os.getenv("TRIGGER_KEY", "").strip()
+
+# Paths written by the setup wizard (module-level so tests can redirect them)
+ENV_PATH         = BASE_DIR / ".env"
+CONFIG_YAML_PATH = BASE_DIR / "obsidian.yaml"
+PROFILES_DIR     = BASE_DIR / "profiles"
 
 app   = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(32).hex()
 app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB max request size
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "").strip().lower()
+    in ("1", "true", "yes", "on"),
+)
 _lock = threading.Lock()
 
 
 # ── Audit logging ────────────────────────────────────────────────────────────
 
 _AUDIT_LOG_DIR = BASE_DIR / "outputs" / "logs"
-_AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    _AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as _e:  # e.g. root-owned bind mount in a non-root container
+    print(f"[Server] WARNING: cannot create {_AUDIT_LOG_DIR}: {_e}")
 
 _audit_logger = logging.getLogger("obsidian.audit")
 _audit_logger.setLevel(logging.INFO)
 _audit_logger.propagate = False
-_audit_handler = logging.FileHandler(str(_AUDIT_LOG_DIR / "audit.log"))
+try:
+    _audit_handler = logging.FileHandler(str(_AUDIT_LOG_DIR / "audit.log"))
+except OSError as _e:
+    print(f"[Server] WARNING: audit log not writable ({_e}) — logging audit events to stderr")
+    _audit_handler = logging.StreamHandler(sys.stderr)
 _audit_handler.setFormatter(logging.Formatter("%(message)s"))
 _audit_logger.addHandler(_audit_handler)
+
+
+_AUDIT_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _audit_clean(value) -> str:
+    """Neutralise CR/LF and other control chars so entries can't be forged."""
+    return _AUDIT_UNSAFE.sub(" ", str(value))
 
 
 def _audit(ip: str, action: str, details: str):
     """Write a structured line to the audit log."""
     ts = datetime.now(timezone.utc).isoformat()
-    _audit_logger.info(f"{ts} | {ip} | {action} | {details}")
+    _audit_logger.info(
+        f"{ts} | {_audit_clean(ip)} | {_audit_clean(action)} | {_audit_clean(details)}"
+    )
 
 
 # ── Rate limiting (in-memory) ────────────────────────────────────────────────
@@ -139,7 +171,8 @@ _INJECTION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# All C0 control chars except TAB, including CR/LF (log-injection vectors), plus DEL
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 _HTML_TAGS = re.compile(r"<[^>]+>")
 
 
@@ -148,8 +181,9 @@ def _validate_topic(topic: str):
     if not topic:
         return topic, None  # empty topic handled downstream
 
-    # Strip HTML tags and control characters
+    # Strip HTML tags and control characters (line breaks become spaces)
     topic = _HTML_TAGS.sub("", topic)
+    topic = re.sub(r"[\r\n]+", " ", topic)
     topic = _CONTROL_CHARS.sub("", topic).strip()
 
     if len(topic) < 5:
@@ -199,24 +233,81 @@ def mark_job_done(name: str):
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-def _check_key():
-    k = (request.headers.get("X-Trigger-Key")
-         or request.args.get("key"))
-    return (not TRIGGER_KEY) or k == TRIGGER_KEY
+_LOOPBACK_ADDRS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-def require_key(f):
+_KEY_NOT_CONFIGURED_MSG = (
+    "TRIGGER_KEY is not set, so the control API is disabled. Set TRIGGER_KEY "
+    "in .env (generate one with: python -c \"import secrets;"
+    "print(secrets.token_urlsafe(32))\") and restart, or run the setup wizard "
+    "from this machine (http://127.0.0.1:PORT) to generate one."
+)
+
+
+def _is_loopback() -> bool:
+    """True if the request originates from this machine."""
+    return (request.remote_addr or "") in _LOOPBACK_ADDRS
+
+
+def _check_key(allow_query: bool = False) -> bool:
+    """Constant-time check of the caller's trigger key.
+
+    Always False when TRIGGER_KEY is unset — the API is never open by default.
+    The ``?key=`` query param is only honoured where ``allow_query`` is set
+    (the SSE /stream endpoint, since EventSource can't send headers).
+    """
+    if not TRIGGER_KEY:
+        return False
+    k = request.headers.get("X-Trigger-Key", "")
+    if not k and allow_query:
+        k = request.args.get("key", "")
+    if not k:
+        return False
+    return hmac.compare_digest(k.encode("utf-8"), TRIGGER_KEY.encode("utf-8"))
+
+
+def _key_guard(f, *, allow_query: bool = False, first_run_loopback: bool = False):
     @wraps(f)
     def wrapped(*args, **kwargs):
-        if not _check_key():
+        if not TRIGGER_KEY:
+            # Fresh local install: let the setup wizard run from loopback only,
+            # so it can generate and persist a TRIGGER_KEY.
+            if first_run_loopback and _is_loopback():
+                return f(*args, **kwargs)
+            return jsonify({
+                "error": "TRIGGER_KEY not configured",
+                "message": _KEY_NOT_CONFIGURED_MSG.replace("PORT", str(PORT)),
+            }), 503
+        if not _check_key(allow_query=allow_query):
+            _audit(request.remote_addr or "unknown", "AUTH_FAILED", request.path)
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return wrapped
 
 
+def require_key(f):
+    """Require a valid X-Trigger-Key header."""
+    return _key_guard(f)
+
+
+def require_key_or_query(f):
+    """Like require_key, but also accepts ?key= (SSE only)."""
+    return _key_guard(f, allow_query=True)
+
+
+def require_key_or_first_run(f):
+    """Like require_key, but open to loopback while TRIGGER_KEY is unset."""
+    return _key_guard(f, first_run_loopback=True)
+
+
 # ── Log helper ────────────────────────────────────────────────────────────────
 
 _LOG_DIR = BASE_DIR / "outputs" / "logs"
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass  # already warned above; _log() tolerates write failures
+_log_write_warned = False
 
 def _log(line: str):
     # Suppress repeated render progress lines — keep only latest
@@ -238,7 +329,11 @@ def _log(line: str):
         with open(log_file, "a") as f:
             f.write(f"{datetime.now(timezone.utc).isoformat()} {line}\n")
     except Exception as e:
-        _log(f"[Server] Warning: failed to write pipeline log: {e}")
+        # Must not call _log() here (infinite recursion); warn once on stderr.
+        global _log_write_warned
+        if not _log_write_warned:
+            _log_write_warned = True
+            print(f"[Server] Warning: failed to write pipeline log: {e}", file=sys.stderr)
 
 
 # ── Pipeline runner ───────────────────────────────────────────────────────────
@@ -263,6 +358,8 @@ def _run_thread(topic: str, resume_from: int, topic_id: str = None):
             "started_at":      datetime.now(timezone.utc).isoformat(),
             "finished_at":     None,
         })
+        # Clear any stale kill flag from a previous run
+        _state.pop("_killed", None)
 
     try:
         _proc = subprocess.Popen(
@@ -433,7 +530,7 @@ MAX_SSE_LIFETIME = 3600  # 1 hour — force client reconnect to prevent zombie t
 
 
 @app.route("/stream")
-@require_key
+@require_key_or_query
 def stream():
     """Server-Sent Events stream for real-time dashboard updates."""
     def generate():
@@ -665,6 +762,10 @@ def kill():
     with _lock:
         proc = _proc
         is_running = _state.get("running", False)
+        if proc and is_running:
+            # Signal _run_thread BEFORE terminating, so it can't observe the
+            # exit first and overwrite the "killed" status.
+            _state["_killed"] = True
     if proc and is_running:
         proc.terminate()
         try:
@@ -675,7 +776,6 @@ def kill():
             _state["running"]     = False
             _state["last_status"] = "killed"
             _state["finished_at"] = datetime.now(timezone.utc).isoformat()
-            _state["_killed"]     = True  # Signal to _run_thread
         _log("[Server] Pipeline killed by user")
         return jsonify({"ok": True, "message": "Pipeline terminated"})
     return jsonify({"error": "No pipeline running"}), 400
@@ -1746,7 +1846,7 @@ _SETUP_API_KEYS = [
 
 
 @app.route("/api/setup/status")
-@require_key
+@require_key_or_first_run
 def api_setup_status():
     """Return setup status: which keys are configured, current profile, providers."""
     keys_status = []
@@ -1766,7 +1866,7 @@ def api_setup_status():
         pass
 
     # List available profiles
-    profiles_dir = BASE_DIR / "profiles"
+    profiles_dir = PROFILES_DIR
     available_profiles = []
     if profiles_dir.exists():
         for f in sorted(profiles_dir.glob("*.yaml")):
@@ -1817,11 +1917,12 @@ def api_setup_status():
         "providers": providers,
         "available_providers": available_providers,
         "setup_complete": required_configured,
+        "trigger_key_configured": bool(TRIGGER_KEY),
     })
 
 
 @app.route("/api/setup/validate", methods=["POST"])
-@require_key
+@require_key_or_first_run
 def api_setup_validate():
     """Validate an API key by making a lightweight test call."""
     data = request.get_json(silent=True) or {}
@@ -1909,84 +2010,305 @@ def api_setup_validate():
     return jsonify(result)
 
 
+_SETUP_ALLOWED_KEYS = frozenset(entry["key"] for entry in _SETUP_API_KEYS)
+_ENV_VALUE_FORBIDDEN = re.compile(r"[\r\n\x00]")
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_CUSTOM_PROVIDER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
+_AUTO_PROVIDER_TYPES = frozenset({"music", "sfx"})
+
+
+def _available_profile_names() -> set:
+    if not PROFILES_DIR.exists():
+        return set()
+    return {
+        f.stem for f in PROFILES_DIR.glob("*.yaml")
+        if not f.name.startswith("_")
+    }
+
+
+def _builtin_providers() -> dict:
+    try:
+        from providers.registry import list_providers
+        return list_providers()
+    except Exception:
+        return {}
+
+
+def _validate_setup_payload(data: dict):
+    """Validate a /api/setup/save payload.
+
+    Returns (keys, profile, providers, errors) with cleaned values.
+    """
+    errors = []
+
+    # ── API keys: allow-listed names, single-line values ──
+    keys_in = data.get("keys") or {}
+    keys = {}
+    if not isinstance(keys_in, dict):
+        errors.append("'keys' must be an object")
+    else:
+        for k, v in keys_in.items():
+            if k not in _SETUP_ALLOWED_KEYS:
+                errors.append(f"Unknown key: {str(k)[:64]!r}")
+                continue
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                errors.append(f"Value for {k} must be a string")
+                continue
+            v = v.strip()
+            if _ENV_VALUE_FORBIDDEN.search(v):
+                errors.append(f"Value for {k} contains a line break or NUL")
+                continue
+            if v:
+                keys[k] = v
+
+    # ── Profile: must be an existing profiles/<name>.yaml ──
+    profile = data.get("profile")
+    if profile is not None and profile != "":
+        if (not isinstance(profile, str)
+                or not _PROFILE_NAME_RE.match(profile)
+                or profile.startswith("_")
+                or profile not in _available_profile_names()):
+            errors.append(f"Unknown profile: {str(profile)[:64]!r}")
+            profile = None
+    else:
+        profile = None
+
+    # ── Providers: built-in name, 'auto' (music/sfx), or custom dotted path ──
+    providers_in = data.get("providers") or {}
+    providers = {}
+    if not isinstance(providers_in, dict):
+        errors.append("'providers' must be an object")
+    else:
+        builtins = _builtin_providers()
+        for ptype, pname in providers_in.items():
+            if ptype not in builtins:
+                errors.append(f"Unknown provider type: {str(ptype)[:32]!r}")
+                continue
+            if pname is None or pname == "":
+                continue  # unchanged
+            if not isinstance(pname, str):
+                errors.append(f"Provider name for {ptype} must be a string")
+                continue
+            pname = pname.strip()
+            if (pname in builtins.get(ptype, [])
+                    or (pname == "auto" and ptype in _AUTO_PROVIDER_TYPES)
+                    or _CUSTOM_PROVIDER_RE.match(pname)):
+                providers[ptype] = pname
+            else:
+                errors.append(
+                    f"Invalid provider for {ptype}: {pname[:64]!r} "
+                    "(use a built-in name or a dotted path like my_pkg.module.ClassName)"
+                )
+
+    return keys, profile, providers, errors
+
+
+def _atomic_write_text(path: Path, content: str, default_mode: int = 0o644):
+    """Write via tmp + os.replace, keeping the file's mode (new files get
+    ``default_mode``). Falls back to an in-place write if the target can't be
+    replaced (e.g. it is a single-file bind mount)."""
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = default_mode
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        os.unlink(tmp)
+        with open(path, "w") as f:
+            f.write(content)
+
+
+def _update_env_file(path: Path, updates: dict):
+    """Set KEY=value lines in a .env file, preserving comments and order."""
+    lines = []
+    if path.exists():
+        with open(path) as f:
+            lines = f.read().splitlines()
+    else:
+        lines = [
+            "# Obsidian Engine — Environment Configuration",
+            "# Auto-saved by Setup Wizard",
+            "",
+        ]
+    remaining = dict(updates)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        k = stripped.split("=", 1)[0].strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        if k in remaining:
+            lines[i] = f"{k}={remaining.pop(k)}"
+    for k, v in remaining.items():
+        lines.append(f"{k}={v}")
+    _atomic_write_text(path, "\n".join(lines) + "\n", default_mode=0o600)
+
+
+def _read_env_value(path: Path, key: str) -> str:
+    if not path.exists():
+        return ""
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            if k.strip() == key:
+                return v.strip().strip('"').strip("'")
+    return ""
+
+
+_YAML_KV_RE = re.compile(r"^(?P<prefix>[ \t]*[A-Za-z0-9_]+:[ \t]*)(?P<value>.*?)(?P<comment>[ \t]+#.*)?$")
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _is_content(line: str) -> bool:
+    s = line.strip()
+    return bool(s) and not s.startswith("#")
+
+
+def _yaml_set_value(line: str, value: str) -> str:
+    m = _YAML_KV_RE.match(line)
+    if not m:
+        return line
+    return f"{m.group('prefix').rstrip()} {value}{m.group('comment') or ''}"
+
+
+def _yaml_block_end(lines: list, start: int) -> int:
+    """Index just past the block owned by the key at lines[start]."""
+    base = _indent_of(lines[start])
+    end = start + 1
+    last_content = start
+    while end < len(lines):
+        if _is_content(lines[end]):
+            if _indent_of(lines[end]) <= base:
+                break
+            last_content = end
+        end += 1
+    return last_content + 1
+
+
+def _yaml_set_profile(content: str, profile: str) -> str:
+    lines = content.split("\n")
+    for i, line in enumerate(lines):
+        if re.match(r"^profile:", line):
+            lines[i] = _yaml_set_value(line, profile)
+            return "\n".join(lines)
+    return content.rstrip("\n") + f"\nprofile: {profile}\n"
+
+
+def _yaml_set_provider(content: str, ptype: str, pname: str) -> str:
+    """Set providers.<ptype>.name via a targeted line edit (keeps comments)."""
+    lines = content.split("\n")
+    pidx = next((i for i, ln in enumerate(lines) if re.match(r"^providers:[ \t]*(#.*)?$", ln)), None)
+    if pidx is None:
+        return content.rstrip("\n") + f"\nproviders:\n  {ptype}:\n    name: {pname}\n"
+    pend = _yaml_block_end(lines, pidx)
+    child_indent = next(
+        (_indent_of(lines[i]) for i in range(pidx + 1, pend) if _is_content(lines[i])), 2,
+    )
+    type_re = re.compile(rf"^[ ]{{{child_indent}}}{re.escape(ptype)}:[ \t]*(#.*)?$")
+    tidx = next((i for i in range(pidx + 1, pend) if type_re.match(lines[i])), None)
+    if tidx is None:
+        pad = " " * child_indent
+        lines[pend:pend] = [f"{pad}{ptype}:", f"{pad}{pad}name: {pname}"]
+        return "\n".join(lines)
+    tend = _yaml_block_end(lines, tidx)
+    grand_indent = next(
+        (_indent_of(lines[i]) for i in range(tidx + 1, tend) if _is_content(lines[i])),
+        child_indent * 2,
+    )
+    for key in ("name", "provider"):
+        name_re = re.compile(rf"^[ ]{{{grand_indent}}}{key}:")
+        for i in range(tidx + 1, tend):
+            if name_re.match(lines[i]):
+                lines[i] = _yaml_set_value(lines[i], pname)
+                return "\n".join(lines)
+    lines.insert(tidx + 1, f"{' ' * grand_indent}name: {pname}")
+    return "\n".join(lines)
+
+
 @app.route("/api/setup/save", methods=["POST"])
-@require_key
+@require_key_or_first_run
 def api_setup_save():
     """Save setup configuration to .env and obsidian.yaml."""
+    global TRIGGER_KEY
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        data = {}
+    ip = request.remote_addr or "unknown"
     saved = []
     errors = []
 
-    # Save API keys to .env
-    keys_to_save = data.get("keys", {})
-    if keys_to_save:
-        env_path = BASE_DIR / ".env"
+    keys_to_save, profile, providers_config, errors = _validate_setup_payload(data)
+    if errors:
+        _audit(ip, "SETUP_REJECTED", "; ".join(errors))
+        return jsonify({"saved": [], "errors": errors, "success": False}), 400
+
+    # First run (no TRIGGER_KEY yet): adopt one already in .env, or mint one.
+    generated_key = None
+    env_updates = dict(keys_to_save)
+    if not TRIGGER_KEY:
+        existing = _read_env_value(ENV_PATH, "TRIGGER_KEY")
+        if existing:
+            TRIGGER_KEY = existing
+            os.environ["TRIGGER_KEY"] = existing
+        else:
+            generated_key = secrets.token_urlsafe(32)
+            env_updates["TRIGGER_KEY"] = generated_key
+
+    # Save API keys (and generated TRIGGER_KEY) to .env
+    if env_updates:
         try:
-            # Read existing .env
-            existing = {}
-            if env_path.exists():
-                with open(env_path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            existing[k.strip()] = v.strip()
-
-            # Update with new keys
+            _update_env_file(ENV_PATH, env_updates)
             for k, v in keys_to_save.items():
-                if v and v.strip():
-                    existing[k] = v.strip()
-                    # Also set in current process
-                    os.environ[k] = v.strip()
-                    saved.append(k)
-
-            # Write .env
-            with open(env_path, "w") as f:
-                f.write("# Obsidian Engine — Environment Configuration\n")
-                f.write("# Auto-saved by Setup Wizard\n\n")
-                for k, v in sorted(existing.items()):
-                    f.write(f"{k}={v}\n")
-
+                os.environ[k] = v  # also apply to the running process
+                saved.append(k)
+            if generated_key:
+                os.environ["TRIGGER_KEY"] = generated_key
+                TRIGGER_KEY = generated_key
+                _audit(ip, "TRIGGER_KEY_GENERATED", "first-run setup wizard")
         except Exception as e:
+            generated_key = None
             errors.append(f"Failed to save .env: {e}")
 
-    # Save profile to obsidian.yaml
-    profile = data.get("profile")
-    providers_config = data.get("providers")
+    # Save profile / providers to obsidian.yaml (targeted edits keep comments)
     if profile or providers_config:
-        yaml_path = BASE_DIR / "obsidian.yaml"
         try:
-            content = yaml_path.read_text()
-
+            content = CONFIG_YAML_PATH.read_text()
             if profile:
-                import re
-                content = re.sub(
-                    r'^profile:\s*\S+',
-                    f'profile: {profile}',
-                    content,
-                    flags=re.MULTILINE,
-                )
+                content = _yaml_set_profile(content, profile)
                 saved.append(f"profile={profile}")
-
-            if providers_config:
-                for ptype, pname in providers_config.items():
-                    import re
-                    # Find the provider section and update the name
-                    pattern = rf'(  {ptype}:\n    name:\s*)\S+'
-                    replacement = rf'\g<1>{pname}'
-                    content = re.sub(pattern, replacement, content)
-                    saved.append(f"providers.{ptype}={pname}")
-
-            yaml_path.write_text(content)
-
+            for ptype, pname in providers_config.items():
+                content = _yaml_set_provider(content, ptype, pname)
+                saved.append(f"providers.{ptype}={pname}")
+            _atomic_write_text(CONFIG_YAML_PATH, content)
         except Exception as e:
             errors.append(f"Failed to save obsidian.yaml: {e}")
 
-    return jsonify({
+    _audit(ip, "SETUP_SAVED", ", ".join(saved) or "(nothing)")
+    resp = {
         "saved": saved,
         "errors": errors,
         "success": len(errors) == 0,
-    })
+    }
+    if generated_key:
+        # Returned exactly once so the operator/dashboard can store it.
+        resp["trigger_key"] = generated_key
+        resp["trigger_key_generated"] = True
+    return jsonify(resp)
 
 
 def require_login(f):
@@ -2019,15 +2341,62 @@ def dashboard_assets(filename):
     return send_from_directory(str(assets_dir), filename)
 
 
+# ── Login rate limiting (in-memory, per IP) ──────────────────────────────────
+
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_SECONDS = 15 * 60
+_login_attempts = defaultdict(list)   # ip -> [timestamps]
+
+
+def _login_rate_limited(ip: str) -> bool:
+    """Record a login attempt; True if the IP exceeded the window budget."""
+    with _rate_lock:
+        attempts = _cleanup_timestamps(_login_attempts[ip], LOGIN_WINDOW_SECONDS)
+        if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+            _login_attempts[ip] = attempts
+            return True
+        attempts.append(_time.time())
+        _login_attempts[ip] = attempts
+        return False
+
+
+_NO_PASSWORD_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>OBSIDIAN ARCHIVE</title></head>
+<body style="background:#020408;color:#b0cce0;font-family:monospace;padding:40px">
+<h1 style="font-size:1rem;letter-spacing:4px">REMOTE ACCESS DISABLED</h1>
+<p>The dashboard can only be used from this machine because DASHBOARD_PASSWORD
+is not set. Set DASHBOARD_PASSWORD (and TRIGGER_KEY) in .env and restart the
+server to enable remote access.</p>
+</body></html>"""
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not DASHBOARD_PASSWORD:
-        return redirect("/")
-    if request.method == "POST":
-        pw = request.form.get("password", "")
-        if hmac.compare_digest(pw, DASHBOARD_PASSWORD):
-            session['authenticated'] = True
+        if _is_loopback():
             return redirect("/")
+        # Don't bounce remote clients back to "/" (the dashboard redirects
+        # 401s to /login, which would loop forever).
+        return _NO_PASSWORD_HTML, 403, {"Content-Type": "text/html; charset=utf-8"}
+    if request.method == "POST":
+        ip = request.remote_addr or "unknown"
+        if _login_rate_limited(ip):
+            _audit(ip, "LOGIN_RATE_LIMITED",
+                   f">{LOGIN_MAX_ATTEMPTS} attempts in {LOGIN_WINDOW_SECONDS}s")
+            return (
+                _LOGIN_HTML.replace("__ERROR__", "Too many attempts, try again later"),
+                429,
+                {"Content-Type": "text/html"},
+            )
+        pw = request.form.get("password", "")
+        if hmac.compare_digest(pw.encode("utf-8"), DASHBOARD_PASSWORD.encode("utf-8")):
+            session.clear()
+            session['authenticated'] = True
+            with _rate_lock:
+                _login_attempts.pop(ip, None)
+            _audit(ip, "LOGIN_OK", "dashboard session")
+            return redirect("/")
+        _audit(ip, "LOGIN_FAILED", "invalid password")
         return (
             _LOGIN_HTML.replace("__ERROR__", "Invalid password"),
             200,
@@ -2046,32 +2415,73 @@ def logout():
     return redirect("/login")
 
 
+def _dashboard_key_for_request() -> str:
+    """TRIGGER_KEY to embed in the dashboard page, or "" if this viewer
+    isn't trusted with it (needs a password session or a loopback client)."""
+    if not TRIGGER_KEY:
+        return ""
+    if DASHBOARD_PASSWORD and session.get("authenticated"):
+        return TRIGGER_KEY
+    if _is_loopback():
+        return TRIGGER_KEY
+    return ""
+
+
+def _js_string_escape(value: str) -> str:
+    """Escape for embedding inside a quoted JS string in an HTML <script>."""
+    return (json.dumps(value)[1:-1]
+            .replace("'", "\\u0027")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e"))
+
+
 @app.route("/")
 @require_login
 def dashboard():
+    key = _js_string_escape(_dashboard_key_for_request())
     # Serve new Preact dashboard if built, else fall back to old HTML
     if _NEW_DASHBOARD_HTML:
-        html = _NEW_DASHBOARD_HTML.replace("__TRIGGER_KEY__", TRIGGER_KEY)
+        html = _NEW_DASHBOARD_HTML.replace("__TRIGGER_KEY__", key)
     else:
-        html = _DASHBOARD_HTML.replace("__TRIGGER_KEY__", TRIGGER_KEY)
+        html = _DASHBOARD_HTML.replace("__TRIGGER_KEY__", key)
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ── Public start function (called by scheduler.py) ───────────────────────────
 
+def _startup_security_warnings():
+    """Print warnings about insecure or incomplete auth configuration."""
+    loopback_bind = HOST in _LOOPBACK_HOSTS
+    if not TRIGGER_KEY:
+        print(
+            "[Server] WARNING: TRIGGER_KEY is not set — the control API is "
+            "disabled (503) until it is. Run the setup wizard from "
+            f"http://127.0.0.1:{PORT} or set TRIGGER_KEY in .env."
+        )
+    elif not DASHBOARD_PASSWORD and not loopback_bind:
+        print(
+            f"[Server] WARNING: listening on {HOST} without DASHBOARD_PASSWORD. "
+            "Remote browsers will not receive the trigger key; set "
+            "DASHBOARD_PASSWORD to use the dashboard remotely. If a reverse "
+            "proxy on this host forwards to the server, requests look like "
+            "loopback — set DASHBOARD_PASSWORD in that case too."
+        )
+
+
 def start_server():
     """Start Flask in a daemon thread. Returns immediately."""
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    _startup_security_warnings()
     t = threading.Thread(
         target=lambda: app.run(
-            host="0.0.0.0", port=PORT, debug=False,
+            host=HOST, port=PORT, debug=False,
             use_reloader=False, threaded=True,
         ),
         daemon=True,
     )
     t.start()
-    print(f"[Server] Dashboard \u2192 http://0.0.0.0:{PORT}")
+    print(f"[Server] Dashboard → http://{HOST}:{PORT}")
     return t
 
 
@@ -2139,5 +2549,6 @@ _DASHBOARD_HTML = _load_dashboard()
 
 
 if __name__ == "__main__":
-    print(f"[Server] Starting standalone on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    print(f"[Server] Starting standalone on {HOST}:{PORT}")
+    _startup_security_warnings()
+    app.run(host=HOST, port=PORT, debug=False)
