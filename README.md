@@ -258,10 +258,11 @@ obsidian-engine/
 - [x] **Docker + Docker Compose** — one-command deployment
 - [x] **Setup Wizard** — browser-based configuration for non-technical users
 - [x] **1,400+ tests** — 26%+ coverage, CI on every push
+- [x] **Local LLMs via Ollama**: the built-in `openai` LLM provider with `base_url` and `default_model` ([setup](docs/PROVIDERS.md#llm-llmprovider)); a native provider is tracked in [#6](https://github.com/harshithkantamneni/obsidian-engine/issues/6)
 - [ ] Knowledge graph for cross-video intelligence ([#20](https://github.com/harshithkantamneni/obsidian-engine/issues/20))
 - [ ] A/B testing for titles & thumbnails ([#25](https://github.com/harshithkantamneni/obsidian-engine/issues/25))
 - [ ] TikTok & Instagram Reels export ([#26](https://github.com/harshithkantamneni/obsidian-engine/issues/26))
-- [ ] More LLM providers: Gemini, Ollama ([#21](https://github.com/harshithkantamneni/obsidian-engine/issues/21), [#6](https://github.com/harshithkantamneni/obsidian-engine/issues/6))
+- [ ] More LLM providers: Gemini ([#21](https://github.com/harshithkantamneni/obsidian-engine/issues/21))
 - [ ] More image providers: DALL-E, Stability AI ([#11](https://github.com/harshithkantamneni/obsidian-engine/issues/11), [#14](https://github.com/harshithkantamneni/obsidian-engine/issues/14))
 
 ## Running Tests

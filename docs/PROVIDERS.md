@@ -88,6 +88,17 @@ def resolve_model(self, tier: str) -> str | None     # default: self.models.get(
 - **Limitations.** Token costs aren't tracked for LLMs other than Anthropic, so the per-run budget cap doesn't cover LLM spend. The pipeline logs this once per run. Claude-vision features (image and thumbnail quality scoring) only run with `anthropic`. Without it, images are accepted as generated and thumbnails get a neutral score.
 - **Built-in `openai` options:** `default_model`, `models`, `base_url` (for any OpenAI-compatible server, e.g. Ollama), `api_key_env`.
 
+**Ollama (local, no API key).** Point the built-in `openai` provider at Ollama's OpenAI-compatible endpoint. It needs `pip install openai`.
+
+```yaml
+providers:
+  llm:
+    name: openai
+    options: {base_url: "http://localhost:11434/v1", default_model: llama3.2:3b}
+```
+
+`default_model` must be a model you've pulled (`ollama pull llama3.2:3b`). Without it the provider asks Ollama for `gpt-4o` and gets a 404. Every tier uses `default_model` unless you also set `models`. Ollama's default context window (4096 tokens on many machines) is far below what the script stages request (up to 16,000 output tokens), so start it with a larger one, e.g. `OLLAMA_CONTEXT_LENGTH=32768 ollama serve`.
+
 ## `tts`: `TTSProvider`
 
 ```python
