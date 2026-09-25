@@ -248,12 +248,10 @@ Note: CI uses bare `python` (GitHub Actions), locally use `.venv/bin/python`. ~1
 - **Adding an era constraint**: Add entry to `ERA_CONSTRAINTS` in `pipeline/images.py` with keywords, year range, positive anchors, and negative prompts.
 - **Scene retention analytics**: Correlation data written to `channel_insights.json["scene_retention_correlation"]`. Read via `get_scene_retention_intelligence()` in `intel/channel_insights.py`.
 
-## Open Issues (19)
+## Open Issues
 
 Contributors welcome! See https://github.com/harshithkantamneni/obsidian-engine/issues
 
 **Good first issues**: Content profiles (gaming, cooking, science, podcast, news), image providers (DALL-E, Stability AI), TTS providers (Google Cloud), footage providers (Pixabay), upload providers (S3/R2), LLM providers (Ollama)
 
 **Help wanted**: Multi-language support, Docker Compose, queue UI management, Whisper word timestamps for OpenAI TTS
-
-**Open PR**: #7 — OpenAI TTS provider (needs rebase onto latest main)
