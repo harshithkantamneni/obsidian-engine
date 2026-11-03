@@ -16,7 +16,7 @@
 
 ```bash
 python run_pipeline.py "The Secret History of the Internet"
-# ☕ Come back in 15 minutes. Your video is on YouTube.
+# ☕ Come back in 25-40 minutes. Your video is ready.
 ```
 
 **See the output live:** every video on [@ObsidianArchiveUnearthed](https://www.youtube.com/@ObsidianArchiveUnearthed) was produced end-to-end by this pipeline.
@@ -29,7 +29,7 @@ python run_pipeline.py "The Secret History of the Internet"
 
 ## Why This Exists
 
-Creating a single YouTube video takes **20-40 hours** of research, writing, recording, editing, and optimization. Obsidian Engine does all of it in **~15 minutes for ~$2**.
+Creating a single YouTube video takes **20-40 hours** of research, writing, recording, editing, and optimization. Obsidian Engine does all of it in an estimated **25-40 minutes for about $4** ([technical report](docs/TECHNICAL_REPORT.md)).
 
 It's not a template filler. Each video gets unique research, a narrative arc, fact-checked scripts, AI narration with pacing control, generated + stock visuals, background music, and SEO-optimized metadata. The pipeline has quality gates at every stage — if something isn't good enough, it rewrites it automatically.
 
@@ -136,13 +136,16 @@ The other defaults need no key: `upload: local` saves to `outputs/final/`, and `
 
 | Component | Cost |
 |-----------|------|
-| AI (Claude — scripts, research, scenes) | $0.50 – $1.50 |
-| Voice (ElevenLabs TTS) | $0.30 – $0.80 |
-| Images (fal.ai generation) | $0.20 – $0.50 |
+| Claude Opus (script writing) | $1.50 |
+| fal.ai (image generation) | $1.20 |
+| Claude Sonnet (analysis agents) | $0.40 |
+| ElevenLabs (TTS) | $0.35 |
+| Claude Haiku (scoring and formatting) | $0.05 |
+| Infrastructure (Railway) | $0.40 |
 | Footage (Pexels) | Free |
-| **Total per video** | **~$1 – $3** |
+| **Total per video** | **~$3.90** |
 
-A 15-minute documentary for the price of a coffee.
+These are estimates from the [technical report](docs/TECHNICAL_REPORT.md), not measured per-run logs. Actual cost depends on video length, model choice and image count.
 
 ## Content Profiles
 
@@ -214,7 +217,7 @@ models:
   light: "claude-haiku-4-5-20251001"  # Fast tasks (compliance, scoring)
 
 cost:
-  budget_max_usd: 5.00          # Hard cap per video (0 = unlimited)
+  budget_max_usd: 0.0           # Optional Claude spend cap per run. 0 = off (default)
 
 video:
   fps: 30
@@ -251,11 +254,11 @@ obsidian-engine/
 - [x] **Quality gates at every stage** — auto-rewrite until standards are met
 - [x] **Script Doctor** — scores scripts on 8 dimensions, rewrites weak areas
 - [x] **Fact verification** — checks claims before publishing
-- [x] **Crash-safe resume** — `--resume` picks up from last checkpoint
+- [x] **Checkpoint and resume** — `--resume` picks up from the last checkpoint. The upload stage isn't idempotent, so a crash around it can publish twice
 - [x] **YouTube Shorts** — auto-generates vertical clips alongside long-form
 - [x] **Series detection** — identifies multi-part topics automatically
 - [x] **Real-time dashboard** — monitor pipeline via browser (SSE)
-- [x] **Cost tracking** — per-video budget caps with real-time token counting
+- [x] **Cost tracking** — token counting and an optional Claude budget cap. The cap covers Claude spend only, and `--resume` resets its counter
 - [x] **Notifications** — Telegram + Discord alerts on completion/failure
 - [x] **Docker + Docker Compose** — one-command deployment
 - [x] **Setup Wizard** — browser-based configuration for non-technical users
