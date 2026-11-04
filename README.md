@@ -31,7 +31,7 @@ python run_pipeline.py "The Secret History of the Internet"
 
 Creating a single YouTube video takes **20-40 hours** of research, writing, recording, editing, and optimization. Obsidian Engine does all of it in an estimated **25-40 minutes for about $4** ([technical report](docs/TECHNICAL_REPORT.md)).
 
-It's not a template filler. Each video gets unique research, a narrative arc, fact-checked scripts, AI narration with pacing control, generated + stock visuals, background music, and SEO-optimized metadata. The pipeline has quality gates at every stage — if something isn't good enough, it rewrites it automatically.
+It's not a template filler. Each video gets unique research, a narrative arc, a fact-check stage on each script, AI narration with pacing control, generated + stock visuals, background music, and SEO-optimized metadata. A script doctor stage scores each script and rewrites weak sections automatically.
 
 ## How It Works
 
@@ -45,7 +45,7 @@ It's not a template filler. Each video gets unique research, a narrative arc, fa
 │  3. Narrative Design   — architects story structure   │
 │  4. Script Writing     — broadcast-quality narration  │
 │  4b. Script Doctor     — scores & rewrites until ✓   │
-│  5. Fact Verification  — checks every claim          │
+│  5. Fact Verification  — checks script claims        │
 └──────────────────────────────────────────────────────┘
          │
          ▼
