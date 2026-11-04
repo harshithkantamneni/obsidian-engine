@@ -31,7 +31,7 @@ python run_pipeline.py "The Secret History of the Internet"
 
 Creating a single YouTube video takes **20-40 hours** of research, writing, recording, editing, and optimization. Obsidian Engine does all of it in an estimated **25-40 minutes for about $4** ([technical report](docs/TECHNICAL_REPORT.md)).
 
-It's not a template filler. Each video gets unique research, a narrative arc, a fact-check stage on each script, AI narration with pacing control, generated + stock visuals, background music, and SEO-optimized metadata. A script doctor stage scores each script and rewrites weak sections automatically.
+It's not a template filler. Each video gets unique research, a narrative arc, a fact-check stage on each script, AI narration with pacing control, generated + stock visuals, background music, and SEO-optimized metadata. A script doctor stage scores each script and rewrites it up to twice, then aborts.
 
 ## How It Works
 
@@ -44,7 +44,7 @@ It's not a template filler. Each video gets unique research, a narrative arc, a 
 │  2. Originality Check  — finds an uncovered angle    │
 │  3. Narrative Design   — architects story structure   │
 │  4. Script Writing     — broadcast-quality narration  │
-│  4b. Script Doctor     — scores & rewrites until ✓   │
+│  4b. Script Doctor     — scores, rewrites up to 2x   │
 │  5. Fact Verification  — checks script claims        │
 └──────────────────────────────────────────────────────┘
          │
@@ -71,7 +71,7 @@ It's not a template filler. Each video gets unique research, a narrative arc, a 
     🎬 Done. Video is live.
 ```
 
-Every stage has **quality gates**, **automatic retries**, and **self-healing recovery**. If Stage 4 produces a weak script, the Script Doctor rewrites it. If an image comes back blurry, it regenerates. If the pipeline crashes mid-run, `--resume` picks up exactly where it left off.
+The pipeline has **quality checks**, **automatic retries**, and **recovery on resume**. If Stage 4 produces a weak script, the Script Doctor rewrites it. If an image comes back blurry, it regenerates. If the pipeline crashes mid-run, `--resume` picks up exactly where it left off.
 
 ## Quick Start
 
@@ -251,7 +251,7 @@ obsidian-engine/
 - [x] **13-stage autonomous pipeline** — topic to YouTube in one command
 - [x] **4 content profiles** — documentary, explainer, true crime, video essay (+ custom)
 - [x] **Pluggable providers** — swap LLM, TTS, images, footage, upload in config
-- [x] **Quality gates at every stage** — auto-rewrite until standards are met
+- [x] **Quality checks** — script scoring with up to 2 rewrites
 - [x] **Script Doctor** — scores scripts on 8 dimensions, rewrites weak areas
 - [x] **Fact verification** — checks claims before publishing
 - [x] **Checkpoint and resume** — `--resume` picks up from the last checkpoint. The upload stage isn't idempotent, so a crash around it can publish twice
