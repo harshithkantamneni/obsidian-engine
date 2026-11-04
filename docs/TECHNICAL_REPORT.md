@@ -32,7 +32,7 @@
 
 ## 1. System Overview
 
-The Obsidian Archive is a production-grade autonomous video pipeline that transforms unstructured text topics into fully rendered, SEO-optimized, YouTube-published documentary videos. The system operates as a 13-stage pipeline coordinating 20 AI agents across 8 external services, with parallel execution, self-learning parameter optimization, and closed-loop analytics feedback.
+The Obsidian Archive is an autonomous video pipeline that transforms unstructured text topics into fully rendered, SEO-optimized, YouTube-published documentary videos. The system operates as a 13-stage pipeline coordinating 20 AI agents across 8 external services, with parallel execution, self-learning parameter optimization, and closed-loop analytics feedback.
 
 **Operational since:** Q1 2026
 **Deployment:** Railway (Docker container, daemon mode)
